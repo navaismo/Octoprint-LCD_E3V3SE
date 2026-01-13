@@ -4,13 +4,14 @@ Plugin to send print job details and thumbnails to the LCD of the E3V3SE (requir
 Fully compatible with Meatpack and M600 commands
 
 ## Table of contents
+- [Requirements](#requirements)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Preview](#preview)
 - [Starting Job](#starting-job)
-- [Author](#author)
 - [Disclaimer](#disclaimer)
 - [License](#license)
+- [Author](#author)
 
 
 
