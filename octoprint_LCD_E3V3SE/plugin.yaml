@@ -1,0 +1,7 @@
+event_hooks:
+  FileSelected:
+    - on_event
+  PrintStarted:
+    - on_event
+  ZChange:
+    - on_event
