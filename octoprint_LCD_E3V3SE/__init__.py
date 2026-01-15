@@ -66,6 +66,7 @@ class LCD_E3V3SEPlugin(
         self.thumb_rendered_event = threading.Event()
         self.pause_gate_active = False
         self.pause_gate_thread = None
+        self.bedscale_warn = False
         
         # Add in __init__ (new state tracking)
         self._last_state_id = "UNKNOWN"
@@ -390,10 +391,18 @@ class LCD_E3V3SEPlugin(
             if state == "PAUSED":
                 if ( self._settings.get(["enable_purge_filament"]) and not self.pause_gate_active):
                     self._plugin_logger.info(">>> Printer is paused. Opening Purge popup.")
-                    self._plugin_manager.send_plugin_message(
-                        self._identifier,
-                        {"type": "purge_popup", "message": "Printer is paused. Do you want to purge filament?"}
-                    )
+                    
+                    if self.bedscale_warn:
+                        self._plugin_manager.send_plugin_message(
+                            self._identifier,
+                            {"type": "purge_popup", "message": "Detected a Change of the bed weight, please check the printer"}
+                        )
+                        self.bedscale_warn = False
+                    else:    
+                        self._plugin_manager.send_plugin_message(
+                            self._identifier,
+                            {"type": "purge_popup", "message": "Printer is paused. Do you want to purge filament?"}
+                        )
 
         if event == "Connected":
             self.send_M9000_cmd("A1")
@@ -555,6 +564,10 @@ class LCD_E3V3SEPlugin(
         return None
 
     def gcode_received_handler(self, comm, line, *args, **kwargs):
+        
+        if line.startswith("BedScale"):
+            self._plugin_logger.info(f"{line}")
+        
         # Firmware tells us LCD is ready
         if line.startswith("M9000"):
             if "lcd-rendered" in line:
@@ -563,6 +576,13 @@ class LCD_E3V3SEPlugin(
 
             if "pause-job" in line:
                 if self._printer.is_printing():
+                    self._printer.pause_print()
+                return line
+            
+            if "pause-job-bs" in line:
+                self._plugin_logger.info("Bed scale weight change detected... Pausing print.")
+                if self._printer.is_printing():
+                    self.bedscale_warn = True
                     self._printer.pause_print()
                 return line
 
@@ -834,6 +854,7 @@ class LCD_E3V3SEPlugin(
         self._stop_pause_gate()
         self.thumb_rendered_event.clear()
         self.pause_gate_thread = None
+        self.bedscale_warn = False
 
         # Reset metadata thread guard
         with self._metadata_lock:
