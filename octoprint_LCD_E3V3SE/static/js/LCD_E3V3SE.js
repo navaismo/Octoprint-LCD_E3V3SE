@@ -6,9 +6,9 @@ $(function () {
             console.log("Attempting to show popup:", message);
 
             // If modal does not exist, create it
-            if ($("#customPopup").length === 0) {
+            if ($("#e3v3selcd-customPopup").length === 0) {
                 $("body").append(`
-                    <div id="customPopup" class="modal fade" tabindex="-1" role="dialog">
+                    <div id="e3v3selcd-customPopup" class="e3v3selcd modal fade" tabindex="-1" role="dialog">
                         <div class="modal-dialog modal-dialog-centered" role="document">
                             <div class="modal-content" style="border-radius: 10px; overflow: hidden;">
                                 <div class="modal-header" style="background: linear-gradient(135deg, #007bff, #6610f2); color: white;">
@@ -20,7 +20,7 @@ $(function () {
                                     </button>
                                 </div>
                                 <div class="modal-body text-center">
-                                    <p id="customPopupMessage" class="mb-3" style="font-size: 16px; font-weight: 500;"></p>
+                                    <p id="e3v3selcd-customPopupMessage" class="mb-3" style="font-size: 16px; font-weight: 500;"></p>
                                     <div class="spinner">
                                         <div class="double-bounce1"></div>
                                         <div class="double-bounce2"></div>
@@ -34,14 +34,14 @@ $(function () {
                 // Add custom CSS styles
                 $("head").append(`
                     <style>
-                        .spinner {
+                        .e3v3selcd .spinner {
                             width: 50px;
                             height: 50px;
                             position: relative;
                             margin: 0 auto;
                         }
         
-                        .double-bounce1, .double-bounce2 {
+                        .e3v3selcd .double-bounce1, .e3v3selcd .double-bounce2 {
                             width: 100%;
                             height: 100%;
                             border-radius: 50%;
@@ -50,14 +50,14 @@ $(function () {
                             position: absolute;
                             top: 0;
                             left: 0;
-                            animation: bounce 2.0s infinite ease-in-out;
+                            animation: e3v3selcd-bounce 2.0s infinite ease-in-out;
                         }
         
-                        .double-bounce2 {
+                        .e3v3selcd .double-bounce2 {
                             animation-delay: -1.0s;
                         }
         
-                        @keyframes bounce {
+                        @keyframes e3v3selcd-bounce {
                             0%, 100% { transform: scale(0.0); }
                             50% { transform: scale(1.0); }
                         }
@@ -66,32 +66,32 @@ $(function () {
             }
 
             // Set the message and show the modal
-            $("#customPopupMessage").text(message);
-            $("#customPopup").modal("show");
+            $("#e3v3selcd-customPopupMessage").text(message);
+            $("#e3v3selcd-customPopup").modal("show");
         }
 
         function closePopup() {
             console.log("Closing popup...");
-            $("#customPopup").modal("hide");
+            $("#e3v3selcd-customPopup").modal("hide");
         }
 
         function closeErrorPopup() {
             console.log("Closing popup...");
-            $("#errorPopup").modal("hide");
+            $("#e3v3selcd-errorPopup").modal("hide");
         }
 
          function closePurgePopup() {
             console.log("Closing popup...");
-            $("#purgePopup").modal("hide");
+            $("#e3v3selcd-purgePopup").modal("hide");
         }
 
         function showErrorPopup(message) {
             console.log("Attempting to show error popup:", message);
 
             // If modal does not exist, create it
-            if ($("#errorPopup").length === 0) {
+            if ($("#e3v3selcd-errorPopup").length === 0) {
                 $("body").append(`
-                    <div id="errorPopup" class="modal fade" tabindex="-1" role="dialog">
+                    <div id="e3v3selcd-errorPopup" class="e3v3selcd modal fade" tabindex="-1" role="dialog">
                         <div class="modal-dialog modal-dialog-centered" role="document">
                             <div class="modal-content" style="border-radius: 10px; overflow: hidden;">
                                 <div class="modal-header" style="background: linear-gradient(135deg, #dc3545, #b30000); color: white;">
@@ -103,7 +103,7 @@ $(function () {
                                     </button>
                                 </div>
                                 <div class="modal-body text-center">
-                                    <p id="errorPopupMessage" class="mb-3" style="font-size: 16px; font-weight: 500;"></p>
+                                    <p id="e3v3selcd-errorPopupMessage" class="mb-3" style="font-size: 16px; font-weight: 500;"></p>
                                     <div class="error-animation">
                                         <div class="circle">
                                             <div class="cross">
@@ -121,7 +121,7 @@ $(function () {
                 // Add custom CSS styles
                 $("head").append(`
                     <style>
-                        .error-animation {
+                        .e3v3selcd .error-animation {
                             display: flex;
                             justify-content: center;
                             align-items: center;
@@ -131,7 +131,7 @@ $(function () {
                             position: relative;
                         }
         
-                        .circle {
+                        .e3v3selcd .circle {
                             width: 60px;
                             height: 60px;
                             background-color: #dc3545;
@@ -140,16 +140,16 @@ $(function () {
                             justify-content: center;
                             align-items: center;
                             position: absolute;
-                            animation: pulse 1.5s infinite;
+                            animation: e3v3selcd-pulse 1.5s infinite;
                         }
         
-                        .cross {
+                        .e3v3selcd .cross {
                             position: relative;
                             width: 40px;
                             height: 40px;
                         }
         
-                        .cross-line {
+                        .e3v3selcd .cross-line {
                             position: absolute;
                             width: 35px;
                             height: 6px;
@@ -160,11 +160,11 @@ $(function () {
                             transform: translate(-50%, -50%) rotate(45deg);
                         }
         
-                        .cross-line:nth-child(2) {
+                        .e3v3selcd .cross-line:nth-child(2) {
                             transform: translate(-50%, -50%) rotate(-45deg);
                         }
         
-                        @keyframes pulse {
+                        @keyframes e3v3selcd-pulse {
                             0% { transform: scale(1); opacity: 0.7; }
                             50% { transform: scale(1.2); opacity: 0.5; }
                             100% { transform: scale(1); opacity: 0.7; }
@@ -174,8 +174,8 @@ $(function () {
             }
 
             // Set the message and show the modal
-            $("#errorPopupMessage").text(message);
-            $("#errorPopup").modal("show");
+            $("#e3v3selcd-errorPopupMessage").text(message);
+            $("#e3v3selcd-errorPopup").modal("show");
         }
 
 
@@ -185,9 +185,9 @@ $(function () {
             console.log("Attempting to show popup:", message);
 
             // If modal does not exist, create it
-            if ($("#purgePopup").length === 0) {
+            if ($("#e3v3selcd-purgePopup").length === 0) {
                 $("body").append(`
-            <div id="purgePopup" class="modal fade" tabindex="-1" role="dialog">
+            <div id="e3v3selcd-purgePopup" class="e3v3selcd modal fade" tabindex="-1" role="dialog">
                 <div class="modal-dialog modal-dialog-centered" role="document">
                     <div class="modal-content" style="border-radius: 10px; overflow: hidden;">
                         <div class="modal-header" style="background: linear-gradient(135deg, #007bff, #6610f2); color: white;">
@@ -199,11 +199,11 @@ $(function () {
                             </button>
                         </div>
                         <div class="modal-body text-center">
-                            <p id="purgePopupMessage" class="mb-3" style="font-size: 16px; font-weight: 500;"></p>
+                            <p id="e3v3selcd-purgePopupMessage" class="mb-3" style="font-size: 16px; font-weight: 500;"></p>
                   
                         </div>
                         <div class="modal-footer">
-                            <button type="button" id="purgeFilamentBtn" class="btn btn-primary">Purge Filament</button>
+                            <button type="button" id="e3v3selcd-purgeFilamentBtn" class="btn btn-primary">Purge Filament</button>
                             <button type="button" class="btn btn-secondary" data-dismiss="modal">Dismiss</button>
                         </div>
                     </div>
@@ -214,14 +214,14 @@ $(function () {
                 // Add custom CSS styles (solo si aún no se añadió)
                 $("head").append(`
             <style>
-                .spinner {
+                .e3v3selcd .spinner {
                     width: 50px;
                     height: 50px;
                     position: relative;
                     margin: 0 auto;
                 }
 
-                .double-bounce1, .double-bounce2 {
+                .e3v3selcd .double-bounce1, .e3v3selcd .double-bounce2 {
                     width: 100%;
                     height: 100%;
                     border-radius: 50%;
@@ -230,14 +230,14 @@ $(function () {
                     position: absolute;
                     top: 0;
                     left: 0;
-                    animation: bounce 2.0s infinite ease-in-out;
+                    animation: e3v3selcd-pulse 2.0s infinite ease-in-out;
                 }
 
                 .double-bounce2 {
                     animation-delay: -1.0s;
                 }
 
-                @keyframes bounce {
+                @keyframes e3v3selcd-pulse {
                     0%, 100% { transform: scale(0.0); }
                     50% { transform: scale(1.0); }
                 }
@@ -245,7 +245,7 @@ $(function () {
         `);
 
                 // Bind click handler for Purge Filament
-                $(document).off("click", "#purgeFilamentBtn").on("click", "#purgeFilamentBtn", function () {
+                $(document).off("click", "#e3v3selcd-purgeFilamentBtn").on("click", "#e3v3selcd-purgeFilamentBtn", function () {
                     console.log("Purge Filament clicked");
                     self.purge_filament();
 
@@ -253,8 +253,8 @@ $(function () {
             }
 
             // Set the message and show the modal
-            $("#purgePopupMessage").text(message);
-            $("#purgePopup").modal("show");
+            $("#e3v3selcd-purgePopupMessage").text(message);
+            $("#e3v3selcd-purgePopup").modal("show");
         }
 
 
