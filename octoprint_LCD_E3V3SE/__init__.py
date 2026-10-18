@@ -487,6 +487,10 @@ class LCD_E3V3SEPlugin(
             self._plugin_logger.info(f"Print Time (min): {self.print_time}")
             self._plugin_logger.info(f"Progress (%): {self.progress}")
 
+            # Re-establish LCD host mode before the existing screen setup.
+            # A1 resets the LCD state, so send it only before metadata/S1.
+            self.send_M9000_cmd("A1")
+
             # Send the print info using custom command M9000    
             self.send_M9000_cmd(f'N"{self.file_name}"')
             time.sleep(0.3)
@@ -537,22 +541,56 @@ class LCD_E3V3SEPlugin(
         """
         tags = tags or kwargs.get("tags") or set()
 
-        if phase != "queuing":
+        if phase != "queuing" or "ignore_blocker" in tags:
             return None
 
-        # Always allow our internal commands to pass unchanged
-        if "ignore_blocker" in tags:
-            return None
+        # Belaya_6 treats unrecognised M117 messages as a new screen and
+        # disables OctoRefresh. Translate the existing slicer/Obico marker
+        # to the firmware's native M73 L (M9000 L is TOTAL layers).
+        layer_match = re.fullmatch(
+            r"M117\s+OBICO_LAYER_INDICATOR(?:\s+|[-: ]+)([0-9]{1,5})\s*",
+            cmd.split(";", 1)[0].strip(), re.IGNORECASE
+        ) if gcode == "M117" else None
+        if layer_match:
+            layer = int(layer_match.group(1))
+            if layer <= 32767:
+                self.current_layer = layer
+                self._logger.info("LCD layer marker -> M73 L%d", layer)
+                return ["M73 L%d" % layer]
 
-        # Always allow temperature polling
-        if gcode == "M105":
-            return None
-
-        # Optional: log M73 commands
-        if cmd.startswith("M73") and self._settings.get(["progress_type"]) == "m73_progress":
-            self._plugin_logger.info(f"=================>> GOT M73 command: {cmd}")
-
+        if gcode == "M73" and self._settings.get(["progress_type"]) == "m73_progress":
+            values = self.parse_m73(cmd)
+            self._logger.info("LCD M73 hook: phase=%s cmd=%r gcode=%r parsed=%r",
+                              phase, cmd, gcode, values)
+            if "R" in values:
+                self.myETA = values["R"]
+            if "P" in values:
+                self.progress = values["P"]
+                # Keep native M73 R/L handling; M9000 has no R/current-layer
+                # parameter in Belaya_6. Return in queue order, no recursion.
+                return [cmd, "M9000 P%g" % self.progress]
         return None
+
+    @staticmethod
+    def parse_m73(cmd):
+        """Read finite, bounded P/R values without partial numeric matches."""
+        text = re.sub(r"\([^()]*\)", " ", cmd.split(";", 1)[0])
+        match = re.fullmatch(r"\s*M73\s*((?:[PRCL]\s*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*)*)",
+                             text, re.IGNORECASE)
+        if not match:
+            return {}
+        values = {}
+        for key, raw in re.findall(r"([PRCL])\s*([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))",
+                                   match.group(1), re.IGNORECASE):
+            key = key.upper()
+            if key not in ("P", "R"):
+                continue
+            value = float(raw)
+            limit = 100 if key == "P" else 71582788
+            if key in values or not math.isfinite(value) or not 0 <= value <= limit:
+                return {}
+            values[key] = value
+        return values
 
     def gcode_received_handler(self, comm, line, *args, **kwargs):
         # Firmware tells us LCD is ready
