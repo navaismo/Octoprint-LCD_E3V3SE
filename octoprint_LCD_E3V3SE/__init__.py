@@ -574,15 +574,16 @@ class LCD_E3V3SEPlugin(
                 self.is_lcd_ready = True
                 return line
 
-            if "pause-job" in line:
-                if self._printer.is_printing():
-                    self._printer.pause_print()
-                return line
-            
+            # Match the specific token before its generic "pause-job" prefix.
             if "pause-job-bs" in line:
                 self._plugin_logger.info("Bed scale weight change detected... Pausing print.")
                 if self._printer.is_printing():
                     self.bedscale_warn = True
+                    self._printer.pause_print()
+                return line
+
+            if "pause-job" in line:
+                if self._printer.is_printing():
                     self._printer.pause_print()
                 return line
 
