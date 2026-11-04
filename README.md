@@ -84,3 +84,23 @@ This project is licensed under the AGPL license.
 
 ## Author
 Created by navaismo
+
+## Purging a paused print
+
+The optional purge button asks the backend to extrude 15 mm at 150 mm/min.
+It preserves the E coordinate, extrusion mode and feedrate and keeps the motors
+enabled. Units must be confirmed as millimeters; unknown extrusion state is
+rejected rather than assuming M82 or M83. The plugin observes sent G-code and
+reads M503/M114 during an ordinary pause. These read-only commands do not move
+or reconfigure the printer. Reconnects clear the saved state.
+
+During a firmware filament change, the button uses M876 S0 only when Marlin
+offers Purge more. Marlin then controls the purge length and preserves its own
+resume position. Earlier insertion/heating prompts must be answered normally.
+Purge requires printer-control permission and an enabled purge option; it is
+unavailable during printing or the thumbnail pause gate. Resume still belongs
+to OctoPrint and the configured pause/resume scripts.
+
+Run the offline regression checks with `python -m unittest discover -s tests`
+and `node tests/test_purge_frontend.js`. Printer validation is still needed for
+absolute/relative extrusion, repeated purges and M600 prompt handling.

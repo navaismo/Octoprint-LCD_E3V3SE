@@ -258,19 +258,21 @@ $(function () {
         }
 
 
-        // Function to purge filament
+        // The backend preserves E, feedrate and extrusion mode, or uses M600's prompt.
+        self.purgePending = false;
         self.purge_filament = function () {
-
-            $.ajax({
-                url: API_BASEURL + "printer/command",
-                type: "POST",
-                dataType: "json",
-                contentType: "application/json; charset=UTF-8",
-                data: JSON.stringify({ command: "M83\nG1 E15 F150\nM84" })
-            }).fail(function (jqXHR, textStatus, errorThrown) {
-                console.error("Purge filament failed:", errorThrown);
-            });
-
+            if (self.purgePending) return;
+            self.purgePending = true;
+            $("#e3v3selcd-purgeFilamentBtn").prop("disabled", true);
+            OctoPrint.simpleApiCommand("LCD_E3V3SE", "purge_filament", {})
+                .fail(function (response) {
+                    const message = response.responseJSON && response.responseJSON.error;
+                    showErrorPopup(message || "Could not purge filament.");
+                })
+                .always(function () {
+                    self.purgePending = false;
+                    $("#e3v3selcd-purgeFilamentBtn").prop("disabled", false);
+                });
         };
 
 

@@ -12,6 +12,10 @@ import inspect
 import logging
 import threading
 
+from flask import jsonify
+from octoprint.access.permissions import Permissions
+from .purge import PurgeState
+
 from PIL import Image
 from octoprint.logging.handlers import CleaningTimedRotatingFileHandler
 
@@ -27,9 +31,12 @@ class LCD_E3V3SEPlugin(
     octoprint.plugin.ProgressPlugin,
     octoprint.plugin.SettingsPlugin,
     octoprint.plugin.AssetPlugin,
-    octoprint.plugin.TemplatePlugin
+    octoprint.plugin.TemplatePlugin,
+    octoprint.plugin.SimpleApiPlugin
 ):
     def __init__(self):
+        self._purge = PurgeState()
+
         # --- Core state ---
         self.plugin_data_folder = None
         self.metadata_dir = None
@@ -77,6 +84,30 @@ class LCD_E3V3SEPlugin(
 
         # --- Logger ---
         self._plugin_logger = logging.getLogger("octoprint.plugins.LCD_E3V3SE")
+
+    def get_api_commands(self):
+        return {"purge_filament": []}
+
+    def on_api_command(self, command, data):
+        if not Permissions.CONTROL.can():
+            return jsonify(error="Printer control permission is required."), 403
+        if command != "purge_filament":
+            return jsonify(error="Unknown command."), 400
+        if not self._settings.get_boolean(["enable_purge_filament"]):
+            return jsonify(error="The purge option is disabled."), 409
+        if not self._printer.is_paused() or self.pause_gate_active:
+            return jsonify(error="Purge is available only during a normal paused print."), 409
+        try:
+            commands = self._purge.begin()
+        except ValueError as error:
+            return jsonify(error=str(error)), 409
+        try:
+            self._printer.commands(commands, tags={"plugin:LCD_E3V3SE:purge"})
+        except Exception:
+            self._purge.reset()
+            self._plugin_logger.exception("Could not queue the purge sequence")
+            return jsonify(error="Could not queue purge. Extrusion state must be read again."), 503
+        return jsonify(success=True)
 
     # Required by new OctoPrint versions
     def is_template_autoescaped(self):
@@ -373,6 +404,8 @@ class LCD_E3V3SEPlugin(
     # Events
     # -----------------------
     def on_event(self, event, payload):
+        if event in ("Connected", "Disconnected", "Error", "PrintCancelled", "PrintDone", "PrintFailed"):
+            self._purge.reset()
         # NOTE: Logging full payload is useful for debug but can be noisy.
         if event != "ZChange":
             self._plugin_logger.info(f">>>>>> Event received: {event}")
@@ -389,6 +422,9 @@ class LCD_E3V3SEPlugin(
 
             if state == "PAUSED":
                 if ( self._settings.get(["enable_purge_filament"]) and not self.pause_gate_active):
+                    if not self._purge.firmware_pause:
+                        # Read current units and E after pause scripts; never infer them.
+                        self._printer.commands(["M503", "M114"], tags={"plugin:LCD_E3V3SE:purge-query"})
                     self._plugin_logger.info(">>> Printer is paused. Opening Purge popup.")
                     self._plugin_manager.send_plugin_message(
                         self._identifier,
@@ -554,7 +590,12 @@ class LCD_E3V3SEPlugin(
 
         return None
 
+    def gcode_sent_handler(self, comm, phase, cmd, cmd_type, gcode, subcode=None, tags=None, *args, **kwargs):
+        if phase == "sent":
+            self._purge.sent(cmd)
+
     def gcode_received_handler(self, comm, line, *args, **kwargs):
+        self._purge.received(line)
         # Firmware tells us LCD is ready
         if line.startswith("M9000"):
             if "lcd-rendered" in line:
@@ -856,7 +897,7 @@ class LCD_E3V3SEPlugin(
 
 
 __plugin_pythoncompat__ = ">=3,<4"
-__plugin_version__ = "0.0.7"
+__plugin_version__ = "0.0.8"
 
 
 def __plugin_load__():
@@ -869,4 +910,5 @@ def __plugin_load__():
         "octoprint.filemanager.preprocessor": __plugin_implementation__.file_preprocessor,
         "octoprint.comm.protocol.gcode.queuing": __plugin_implementation__.gcode_sending_handler,
         "octoprint.comm.protocol.gcode.received": __plugin_implementation__.gcode_received_handler,
+        "octoprint.comm.protocol.gcode.sent": __plugin_implementation__.gcode_sent_handler,
     }
