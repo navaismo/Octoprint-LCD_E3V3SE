@@ -1,7 +1,6 @@
 # Coding=utf 8
 from __future__ import absolute_import
 
-import math
 import io
 import os
 import re
@@ -15,6 +14,8 @@ import threading
 from flask import jsonify
 from octoprint.access.permissions import Permissions
 from .purge import PurgeState
+from .drawing import DrawingClient
+from .print_card import card_operations, rgb565
 
 from PIL import Image
 from octoprint.logging.handlers import CleaningTimedRotatingFileHandler
@@ -36,6 +37,13 @@ class LCD_E3V3SEPlugin(
 ):
     def __init__(self):
         self._purge = PurgeState()
+        self._draw = DrawingClient(lambda cmd: self._printer.commands(cmd, tags={"ignore_blocker"}))
+        self._render_generation = 0
+        self._render_attempted = False
+        self._pending_render = None
+        self._rendering_generation = -1
+        self._hold_lock = threading.RLock()
+        self._hold_owned = False
 
         # --- Core state ---
         self.plugin_data_folder = None
@@ -55,24 +63,15 @@ class LCD_E3V3SEPlugin(
         self.print_finish = False
         self.sent_imagemap = False
 
-        # --- Thumbnail TX helpers (ACK/CHUNK logic from your firmware) ---
-        self.printer_busy = False
-        self.get_last_chunk = False
-        self.chunk_index = 0
-        self.txLine = None
-        self.nextLineAck = False
+        # File-stream hold used only during initial card rendering.
 
         # --- Metadata thread guard (avoid double-start per file) ---
         self._metadata_lock = threading.Lock()
         self._metadata_running = False
-        self._metadata_last_file = None
 
-        # --- NEW: Robust pause gate (fixes PAUSING->PAUSED race) ---
-        # We pause at PrintStarted if we still need to send the thumbnail,
-        # and we resume only after firmware says "thumbnail-rendered".
+        # Completion never changes OctoPrint pause or prompt state.
         self.thumb_rendered_event = threading.Event()
         self.pause_gate_active = False
-        self.pause_gate_thread = None
         
         # Add in __init__ (new state tracking)
         self._last_state_id = "UNKNOWN"
@@ -243,6 +242,7 @@ class LCD_E3V3SEPlugin(
             "file_name": file_name,
             "file_path": path,
             "total_layers": total_layers,
+            "layer_height": self.find_layer_height_from_content(file_content),
             "print_time": print_time,
             "current_layer": 0,
             "progress": progress,
@@ -267,137 +267,93 @@ class LCD_E3V3SEPlugin(
     # Thread guards
     # -----------------------
     def _start_metadata_thread_once(self, file_name, thumb_enabled):
-        """Start metadata processing in a background thread (idempotent per file)."""
-        if not file_name:
+        if not file_name or self._render_attempted:
             return
-
         with self._metadata_lock:
-            if self._metadata_running and self._metadata_last_file == file_name:
+            if self._metadata_running and self._rendering_generation == self._render_generation:
                 return
+            self._pending_render = (file_name, thumb_enabled, self._render_generation)
+            if self._metadata_running:
+                return
+            with self._hold_lock:
+                if not self._printer.set_job_on_hold(True, blocking=False):
+                    self._plugin_logger.warning("Could not hold the job; keeping native print controls")
+                    self._render_attempted = True
+                    self._pending_render = None
+                    return
+                self._hold_owned = True
+                self.pause_gate_active = True
             self._metadata_running = True
-            self._metadata_last_file = file_name
-
-        def _runner():
-            try:
-                self.get_print_metadata(file_name, thumb_enabled)
-            finally:
-                with self._metadata_lock:
-                    self._metadata_running = False
-
-        threading.Thread(target=_runner, daemon=True).start()
-
-    # -----------------------
-    # Robust pause gate (fix)
-    # -----------------------
-    def _start_pause_gate(self, timeout_s=180):
-        """
-        Pause the print and keep retrying resume until thumbnail-rendered arrives.
-        FIX: Do not trust is_printing() during transitions. Wait for stable PRINTING state.
-        """
-        if self.pause_gate_thread and self.pause_gate_thread.is_alive():
-            return
-
-        self.thumb_rendered_event.clear()
-        self.pause_gate_active = True
-
-        def _state():
-            # Prefer event-derived state (more accurate than is_printing() during races)
-            return getattr(self, "_last_state_id", "UNKNOWN")
-
-        def _wait_stable_printing(stable_s=2.0, window_s=10.0):
-            """
-            Return True if we observe PRINTING continuously for stable_s seconds.
-            """
-            end_window = time.time() + window_s
-            stable_start = None
-
-            while time.time() < end_window and self.pause_gate_active:
-                s = _state()
-
-                if s == "PRINTING":
-                    if stable_start is None:
-                        stable_start = time.time()
-                    elif (time.time() - stable_start) >= stable_s:
-                        return True
-                else:
-                    stable_start = None
-
-                time.sleep(0.2)
-
-            return False
 
         def worker():
-            try:
-                self._plugin_logger.info("GATE: Pausing print until firmware sends 'thumbnail-rendered'...")
-
-                # Request pause (Printing -> Pausing -> Paused)
-                if self._printer.is_printing():
-                    self._printer.pause_print()
-
-                ok = self.thumb_rendered_event.wait(timeout=timeout_s)
-                if not ok:
-                    self._plugin_logger.warning("GATE: Timeout waiting 'thumbnail-rendered'. Trying to resume anyway.")
-                else:
-                    self._plugin_logger.info("GATE: 'thumbnail-rendered' received. Resuming print...")
-
-                # Give OctoPrint a tiny moment to finish the PAUSE state transition
-                time.sleep(0.3)
-
-                # Robust resume loop
-                end_time = time.time() + 30.0  # bigger window for slow state transitions
-                resume_attempts = 0
-
-                while time.time() < end_time and self.pause_gate_active:
-                    s = _state()
-
-                    # If fully paused, resume
-                    if s == "PAUSED":
-                        try:
-                            self._printer.resume_print()
-                            resume_attempts += 1
-                            self._plugin_logger.info(f"GATE: resume_print() attempt #{resume_attempts}")
-                        except Exception as e:
-                            self._plugin_logger.error(f"GATE: resume_print failed: {e}")
-
-                        # After resume request, wait for stable PRINTING
-                        if _wait_stable_printing(stable_s=2.0, window_s=8.0):
-                            self._plugin_logger.info("GATE: Printer is PRINTING and stable. Gate complete.")
-                            return
-
-                        # If not stable yet, keep looping (OctoPrint might bounce)
-                        time.sleep(0.5)
+            while True:
+                with self._metadata_lock:
+                    pending = self._pending_render
+                    self._pending_render = None
+                    if pending is not None:
+                        self._rendering_generation = pending[2]
+                if pending is not None:
+                    name, enabled, generation = pending
+                    try:
+                        self.get_print_metadata(name, enabled, generation)
+                    except Exception:
+                        self._plugin_logger.exception("Print-card rendering failed; releasing the job hold")
+                    finally:
+                        if generation == self._render_generation:
+                            self._render_attempted = True
+                with self._metadata_lock:
+                    if self._pending_render is not None:
                         continue
+                    self._release_render_hold()
+                    self._metadata_running = False
+                    self._rendering_generation = -1
+                    break
+            self._plugin_manager.send_plugin_message(self._identifier, dict(type="close_popup"))
+        threading.Thread(target=worker, daemon=True).start()
 
-                    # If pausing, just wait (do not declare success)
-                    if s == "PAUSING":
-                        time.sleep(0.25)
-                        continue
+    def _release_render_hold(self):
+        # OctoPrint counts holds. Release exactly the one acquired by this worker.
+        with self._hold_lock:
+            if self._hold_owned:
+                try:
+                    self._printer.set_job_on_hold(False)
+                except RuntimeError:
+                    pass  # The connection and its hold counter were discarded.
+                self._hold_owned = False
+            self.pause_gate_active = False
 
-                    # If printing, require stability before declaring success
-                    if s == "PRINTING":
-                        if _wait_stable_printing(stable_s=2.0, window_s=6.0):
-                            self._plugin_logger.info("GATE: Printer is PRINTING and stable. Gate complete.")
-                            return
-                        time.sleep(0.25)
-                        continue
+    def _select_render_file(self, name, path):
+        self._stop_pause_gate()
+        self.file_name, self.file_path = name, path
+        self.sent_imagemap = self.is_lcd_ready = False
+        self._render_attempted = False
+        version = self._draw.version
+        self._draw = DrawingClient(lambda cmd: self._printer.commands(cmd, tags={"ignore_blocker"}))
+        self._draw.version = version
 
-                    # For other states (STARTING/OPERATIONAL/etc), just wait and retry
-                    time.sleep(0.25)
+    def gcode_script_hook(self, comm, script_type, script_name, *args, **kwargs):
+        # Read the actual job here: FileSelected is dispatched asynchronously.
+        if script_type == "gcode" and script_name == "beforePrintStarted":
+            job = self._printer.get_current_job() or {}
+            file = job.get("file") or {}
+            if file.get("origin") == "sdcard":
+                return None
+            name, path = file.get("name"), file.get("path")
+            if name and (name != self.file_name or path != self.file_path or self._draw.cancelled):
+                self._select_render_file(name, path)
+            self._start_metadata_thread_once(self.file_name, self._settings.get(["enable_gcode_preview"]))
+        return None
 
-                self._plugin_logger.warning("GATE: Resume loop ended. Printer may still be paused.")
-
-            except Exception as e:
-                self._plugin_logger.error(f"GATE: Exception in pause gate worker: {e}")
-            finally:
-                self.pause_gate_active = False
-
-        self.pause_gate_thread = threading.Thread(target=worker, daemon=True)
-        self.pause_gate_thread.start()
+    # -----------------------
+    # Render cancellation
+    # -----------------------
 
 
     def _stop_pause_gate(self):
-        """Disable gate loops and unblock waiters (used on cancel/done)."""
-        self.pause_gate_active = False
+        with self._metadata_lock:
+            self._render_generation += 1
+            self._pending_render = None
+        self._draw.cancel(disconnected=not self._printer.is_operational())
         self.thumb_rendered_event.set()
 
     # -----------------------
@@ -406,161 +362,90 @@ class LCD_E3V3SEPlugin(
     def on_event(self, event, payload):
         if event in ("Connected", "Disconnected", "Error", "PrintCancelled", "PrintDone", "PrintFailed"):
             self._purge.reset()
-        # NOTE: Logging full payload is useful for debug but can be noisy.
-        if event != "ZChange":
-            self._plugin_logger.info(f">>>>>> Event received: {event}")
-
-        if event == "PrinterStateChanged":
-            state = payload.get("state_id", "UNKNOWN")
-            self._last_state_id = state
-            self._last_state_ts = time.time()
-            
-            self._plugin_logger.info(f">>>>>> ++++ Intercepted state: {state}")
-
-            if state == "STARTING":
-                self._plugin_logger.info(">>> Print Job is starting.")
-
-            if state == "PAUSED":
-                if ( self._settings.get(["enable_purge_filament"]) and not self.pause_gate_active):
-                    if not self._purge.firmware_pause:
-                        # Read current units and E after pause scripts; never infer them.
-                        self._printer.commands(["M503", "M114"], tags={"plugin:LCD_E3V3SE:purge-query"})
-                    self._plugin_logger.info(">>> Printer is paused. Opening Purge popup.")
-                    self._plugin_manager.send_plugin_message(
-                        self._identifier,
-                        {"type": "purge_popup", "message": "Printer is paused. Do you want to purge filament?"}
-                    )
-
         if event == "Connected":
             self.send_M9000_cmd("A1")
-
-        if event == "FileSelected":
-            self.file_name = payload.get("name")
-            self.file_path = payload.get("path")
-
-            # If the file comes from SD card, we don't handle metadata (as you wanted)
+            self._draw.connected()
+        elif event in ("Disconnected", "Error", "PrintCancelled", "PrintFailed"):
+            self._stop_pause_gate()
+        elif event == "FileSelected":
             if payload.get("origin") == "sdcard":
-                self._plugin_logger.info("File selected from SD Card, not processing metadata.")
                 return
-
-            # Reset flags for a fresh render
-            self.sent_imagemap = False
-            self.is_lcd_ready = False
-
-            try:
-                if self._settings.get(["enable_gcode_preview"]):
-                    self._plugin_logger.info("FileSelected: Will render G-code thumbnail.")
-                    self._plugin_manager.send_plugin_message(
-                        self._identifier,
-                        {"type": "popup", "message": "Rendering Data in the LCD. Please Wait..."}
-                    )
-                    self._start_metadata_thread_once(self.file_name, True)
-                else:
-                    self._plugin_logger.info("FileSelected: Thumbnail disabled, using default thumbnail.")
-                    self.send_M9000_cmd("S0")
-                    self._start_metadata_thread_once(self.file_name, False)
-
-            except Exception as e:
-                self._plugin_logger.error(f"{self.get_current_function_name()}: {e}")
-                my_err = f"Error Ocurred! \n \n {e}.\n Try uploading the file again"
-                self._plugin_manager.send_plugin_message(self._identifier, {"type": "error_popup", "message": my_err})
-
-        if event == "PrintStarted":
-            self.slicer_values()
-            self._plugin_logger.info(">>>+++ PrintStarted <<<")
+            name, path = payload.get("name"), payload.get("path")
+            if (self._metadata_running or self._printer.is_printing()) and name == self.file_name and path == self.file_path:
+                return  # The synchronous start hook already owns this selection.
+            self._select_render_file(name, path)
+            self._start_metadata_thread_once(self.file_name, self._settings.get(["enable_gcode_preview"]))
+        elif event == "PrintStarted":
             self.start_time = time.time()
-
-            # If direct print races FileSelected, ensure metadata thread is started
-            # and gate the print until we confirm thumbnail rendered.
-            if self._settings.get(["enable_gcode_preview"]) and self.file_name and not self.sent_imagemap:
-                self._start_pause_gate(timeout_s=180)
-                self._start_metadata_thread_once(self.file_name, True)
-
-        if event == "PrintCancelled":
-            # Stop gates first to avoid leaving printer paused
+        elif event == "PrintDone":
             self._stop_pause_gate()
-            self.cleanup()
-
-        if event == "PrintDone":
-            # Stop gates first
-            self._stop_pause_gate()
-
-            e_time = self.get_elapsed_time()
-            self.send_M9000_cmd(f"T{e_time} L{self.total_layers} P100")
             self.send_M9000_cmd("F1")
-
-            self._plugin_logger.info(">>>+++ PrintDone <<<")
-            self.cleanup()
             self.print_finish = True
+        elif event == "PrinterStateChanged":
+            self._last_state_id = payload.get("state_id", "UNKNOWN")
+            if self._last_state_id == "PAUSED" and self._settings.get(["enable_purge_filament"]) and not self.pause_gate_active:
+                if not self._purge.firmware_pause:
+                    self._printer.commands(["M503", "M114"], tags={"plugin:LCD_E3V3SE:purge-query"})
+                self._plugin_manager.send_plugin_message(self._identifier, {"type":"purge_popup", "message":"Printer is paused. Do you want to purge filament?"})
 
     # -----------------------
     # Metadata sender
     # -----------------------
-    def get_print_metadata(self, file_name, thumb_enabled):
-        """Load metadata JSON and send print info + thumbnail to the firmware."""
-        try:
-            self._plugin_logger.info(f">>>>>> Called get_print_metadata for {file_name}")
-
-            # Always reset this so we don't skip waiting due to stale state
-            self.is_lcd_ready = False
-
-            md = self.load_metadata_from_json(file_name)
-            if md is None:
-                self._plugin_logger.error("get_print_metadata: metadata JSON not found/invalid.")
-                return None
-
-            self.file_name = md.get("file_name")
-            self.file_path = md.get("file_path")
-            self.total_layers = md.get("total_layers")
-            self.print_time = md.get("print_time")
-            self.current_layer = md.get("current_layer", 0)
-            self.progress = md.get("progress", 0)
-            self.b64_thumb = md.get("thumb_data")
-
-            self._plugin_logger.info("Sending Print Info (M9000)")
-            self._plugin_logger.info(f"File Name: {self.file_name}")
-            self._plugin_logger.info(f"Total Layers: {self.total_layers}")
-            self._plugin_logger.info(f"Print Time (min): {self.print_time}")
-            self._plugin_logger.info(f"Progress (%): {self.progress}")
-
-            # Send the print info using custom command M9000    
-            self.send_M9000_cmd(f'N"{self.file_name}"')
-            time.sleep(0.3)
-            self.send_M9000_cmd(f"T{self.print_time} L{self.total_layers} P{self.progress}")
-            time.sleep(0.3)
-            self._printer.commands(f"M73 R{self.print_time}")  
-            time.sleep(0.3)
-            self.send_M9000_cmd("S1")  # start rendering screen
-
-            # Wait for LCD-ready signal from firmware
-            t0 = time.time()
-            while not self.is_lcd_ready:
-                # Avoid infinite loop if printer disconnects
-                if not self._printer.is_operational():
-                    self._plugin_logger.warning("LCD wait aborted: printer not operational.")
-                    return None
-                if time.time() - t0 > 30.0:
-                    self._plugin_logger.warning("LCD wait timeout (30s). Continuing anyway.")
-                    break
-                time.sleep(0.2)
-
-            self._plugin_logger.info("LCD print info rendered. Sending thumbnail...")
-            time.sleep(0.15)
-
-            if self._settings.get(["enable_gcode_preview"]) and thumb_enabled:
-                if not self.sent_imagemap:
-                    self.send_thumb_imagemap(self.b64_thumb, "M9001")
-            else:
-                self._plugin_logger.info("Thumbnail disabled or skipped.")
-                self.send_M9000_cmd("D1")
-
-            return True
-
-        except Exception as e:
-            self._plugin_logger.error(f"{self.get_current_function_name()}: {e}")
-            my_err = f"Error Ocurred! \n \n {e}.\n Try uploading the file again"
-            self._plugin_manager.send_plugin_message(self._identifier, {"type": "error_popup", "message": my_err})
+    def get_print_metadata(self, file_name, thumb_enabled, generation=None):
+        generation = self._render_generation if generation is None else generation
+        draw = self._draw
+        file_path = self.file_path or file_name
+        md = self.load_metadata_from_json(file_name) or {}
+        if generation != self._render_generation or self._purge.firmware_pause:
             return False
+        total = md.get("total_layers")
+        height = md.get("layer_height")
+        try:
+            total = max(0, min(65535, int(total or 0)))
+        except (ValueError, TypeError, OverflowError):
+            total = 0
+        try:
+            height = max(0, min(65535, round(float(height or 0) * 1000)))
+        except (ValueError, TypeError, OverflowError):
+            height = 0
+        if not height:
+            # Old metadata JSON may predate layer_height. Recover from the stored
+            # G-code before rendering, without requiring another upload.
+            recovered = self.find_layer_height_from_file(file_path)
+            if generation != self._render_generation or draw.cancelled:
+                return False
+            if recovered is not None:
+                height = round(recovered * 1000)
+                md["layer_height"] = recovered
+                self.save_metadata_to_json(file_name, md)
+        pixels = None
+        if thumb_enabled and md.get("thumb_data"):
+            try:
+                pixels = rgb565(self.decode_base64_image(md["thumb_data"]))
+            except Exception:
+                self._plugin_logger.warning("Invalid thumbnail; drawing the placeholder", exc_info=True)
+        operations = card_operations(pixels)
+        if generation != self._render_generation or draw.cancelled:
+            return False
+        name = "".join(c if 32 <= ord(c) < 127 and c not in ";*" else " " for c in (file_name or "Print")).replace('"', "'").replace("\n", " ").replace("\r", " ")[:49]
+        self.send_M9000_cmd('N"' + name + '"')
+        self.send_M9000_cmd("L{} H{}".format(total, height))
+        estimated = md.get("print_time")
+        try:
+            estimated = max(0, min(0xFFFFFFFF, int(float(estimated or 0))))
+        except (ValueError, TypeError, OverflowError):
+            estimated = 0
+        # Snapshot the job's initial estimate independently of live M73 R updates.
+        self.send_M9000_cmd("E{}".format(estimated))
+        self._printer.commands("M73 R{}".format(estimated), tags={"ignore_blocker"})
+        self.send_M9000_cmd("S1")
+        draw.render(operations)
+        if generation != self._render_generation:
+            return False
+        self.send_M9000_cmd("D1")
+        self.sent_imagemap = True
+        self.thumb_rendered_event.set()
+        return True
 
     # -----------------------
     # G-code hooks
@@ -569,7 +454,7 @@ class LCD_E3V3SEPlugin(
         """
         IMPORTANT:
         We do NOT block the queue. Queue blocking can create comm deadlocks.
-        Direct-print correctness is handled by pausing the print while we transmit the thumbnail.
+        The synchronous beforePrintStarted hook holds only the file stream.
         """
         tags = tags or kwargs.get("tags") or set()
 
@@ -596,64 +481,24 @@ class LCD_E3V3SEPlugin(
 
     def gcode_received_handler(self, comm, line, *args, **kwargs):
         self._purge.received(line)
-        # Firmware tells us LCD is ready
+        self._draw.received(line)
+        if line.startswith(("//action:prompt_begin", "//action:paused")):
+            self._draw.cancel()
         if line.startswith("M9000"):
             if "lcd-rendered" in line:
                 self.is_lcd_ready = True
-                return line
-
-            if "pause-job" in line:
-                if self._printer.is_printing():
-                    self._printer.pause_print()
-                return line
-
-            if "resume-job" in line:
-                if self._printer.is_paused():
+            elif "pause-job" in line and self._printer.is_printing():
+                self._printer.pause_print()
+            elif "resume-job" in line and self._printer.is_paused():
+                if not self._purge.firmware_pause:
                     self._plugin_manager.send_plugin_message(self._identifier, dict(type="close_purge_popup"))
                     self._printer.resume_print()
-                return line
-            
-            if "cancel-job" in line:
+            elif "cancel-job" in line:
+                # Stop also dismisses a selected-file preview before printing.
+                self._stop_pause_gate()
+                self._plugin_manager.send_plugin_message(self._identifier, dict(type="close_purge_popup"))
                 if self._printer.is_printing() or self._printer.is_paused():
-                    self._plugin_manager.send_plugin_message(self._identifier, {"type": "error_popup", "message": "Print cancelled from LCD"})
                     self._printer.cancel_print()
-                return line
-
-        # Firmware tells us thumbnail finished
-        if line.startswith("M9001"):
-            if "thumbnail-rendered" in line:
-                self._plugin_logger.info("M9001 thumbnail-rendered received from firmware.")
-                self._plugin_manager.send_plugin_message(self._identifier, dict(type="close_popup"))
-
-                self.sent_imagemap = True
-
-                # Signal the pause gate wroker (do NOT resume here to avoid PAUSING->PAUSED race)
-                self.thumb_rendered_event.set()
-                return line
-
-            if "CHUNK" in line:
-                if self.get_last_chunk:
-                    try:
-                        self.chunk_index = int(line.split("|")[0].split(" ")[2])
-                    except Exception:
-                        pass
-                return line
-
-            if self.txLine is not None and f"ACK LINE {self.txLine}" in line:
-                self.nextLineAck = True
-                return line
-
-        # Busy flags (optional)
-        if "busy: processing" in line:
-            self.printer_busy = True
-            if self.get_last_chunk:
-                self.get_last_chunk = False
-            return line
-
-        if "ok" in line:
-            self.printer_busy = False
-            return line
-
         return line
 
     # -----------------------
@@ -664,118 +509,59 @@ class LCD_E3V3SEPlugin(
         cmd = f"M9000 {value}"
         self._printer.commands(cmd, tags={"ignore_blocker"})
 
-    def send_M9001_cmd(self, value):
-        """Send raw M9001 command string with internal tag."""
-        self._printer.commands(value, tags={"ignore_blocker"})
 
     # -----------------------
-    # Timing helpers
+    # Thumbnail decoding
     # -----------------------
-    def seconds_to_hms(self, seconds_float):
-        if not isinstance(seconds_float, (int, float)):
-            seconds_float = 0
-        seconds = int(round(seconds_float))
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        seconds = seconds % 60
-        return f"{hours:02}:{minutes:02}:{seconds:02}"
 
-    def get_elapsed_time(self):
-        if self.start_time is None:
-            return "0"
-        self.elapsed_time = time.time() - self.start_time
-        self.start_time = None
-        seconds = int(math.ceil(self.elapsed_time))
-        minutes = seconds // 60
-        return minutes
 
     # -----------------------
     # Thumbnail pipeline
     # -----------------------
-    def send_thumb_imagemap(self, b64, o_cmd):
-        self._plugin_logger.info(">>>>>> Sending Thumbnail Image Map")
 
-        if not b64:
-            self._plugin_logger.warning("Thumbnail data not found.")
-            self._plugin_manager.send_plugin_message(self._identifier, dict(type="close_popup"))
-            self.sent_imagemap = True
-            self.thumb_rendered_event.set()  # avoid infinite pause if no thumbnail
-            return
-
-        img = self.decode_base64_image(b64)
-        pixel_data = self.get_pixel_data(img)
-
-        expected_size = 96 * 96 if o_cmd == "M9001" else 26 * 240
-        if len(pixel_data) != expected_size:
-            raise ValueError(f"Expected pixel data size {expected_size}, but got {len(pixel_data)}")
-
-        self.send_image_to_marlin(pixel_data, o_cmd)
-
-    def send_image_to_marlin(self, pixel_data, o_cmd):
-        """
-        CRITICAL:
-        When printing (or paused during print), OctoPrint uses numbered lines: 'N.. <cmd> *checksum'
-        That increases line length. If the command becomes too long, Marlin may complain:
-        'Error:No Checksum with line number' and request Resend forever.
-
-        Fix: Reduce pixels_per_chunk in numbered mode.
-        """
-        numbered_mode = self._printer.is_printing() or self._printer.is_paused()
-
-        # Safer default in numbered mode (keep lines short)
-        pixels_per_chunk = 12 if numbered_mode else 20
-
-        self._plugin_logger.info(
-            f"Starting HEX thumbnail transmission (pixels_per_chunk={pixels_per_chunk}, numbered_mode={numbered_mode})"
-        )
-
-        try:
-            self._printer.commands(f"{o_cmd} START", tags={"ignore_blocker"})
-
-            for y in range(96):
-                start_idx = y * 96
-                line_data = pixel_data[start_idx:start_idx + 96]
-                hex_string = "".join(f"{val:04X}" for val in line_data)
-
-                step = pixels_per_chunk * 4  # 4 hex chars per pixel
-
-                for i in range(0, len(hex_string), step):
-                    chunk_hex = hex_string[i:i + step]
-                    x_offset = i // 4
-                    command = f"{o_cmd} C {y} {x_offset} {chunk_hex}"
-                    self._printer.commands(command, tags={"ignore_blocker"})
-
-            self._printer.commands(f"{o_cmd} END", tags={"ignore_blocker"})
-            self.sent_imagemap = True
-
-        except Exception as e:
-            self._plugin_logger.error(f"send_image_to_marlin error: {e}")
-            # If we fail, unblock the pause gate to avoid leaving the printer paused forever
-            self.thumb_rendered_event.set()
 
     def decode_base64_image(self, b64_string):
         image_data = base64.b64decode(b64_string)
         return Image.open(io.BytesIO(image_data))
 
-    def get_pixel_data(self, image):
-        img = image.convert("RGB")
-        width, height = img.size
-        imgbytes = img.tobytes()
-
-        pixel_map = []
-        for y in range(height):
-            for x in range(width):
-                idx = (y * width + x) * 3
-                r_scaled = (imgbytes[idx] * 31) // 255
-                g_scaled = (imgbytes[idx + 1] * 63) // 255
-                b_scaled = (imgbytes[idx + 2] * 31) // 255
-                color16bit = (r_scaled << 11) | (g_scaled << 5) | b_scaled
-                pixel_map.append(color16bit)
-        return pixel_map
 
     # -----------------------
     # Parsers
     # -----------------------
+    def find_layer_height_from_content(self, content):
+        # Orca appends its settings after EXECUTABLE_BLOCK_END. The last valid
+        # exact key wins; first_layer_height and support settings are different.
+        pattern = r"^[ \t]*;[ \t]*(?:layer_height|layer[ \t]+height)[ \t]*[:=][ \t]*([0-9]+(?:\.[0-9]*)?|\.[0-9]+)[ \t]*(?:mm[ \t]*)?\r?$"
+        height = None
+        for match in re.finditer(pattern, content, re.MULTILINE | re.IGNORECASE):
+            value = float(match.group(1))
+            if 0 < value <= 65.535:
+                height = value
+        return height
+
+    def find_layer_height_from_file(self, file_path):
+        # Read a bounded footer first, then a header for slicers with no footer.
+        # Use OctoPrint's storage path resolver, including subdirectories.
+        try:
+            path = self._file_manager.path_on_disk("local", file_path)
+            with open(path, "rb") as stream:
+                limit = 64 * 1024
+                start = max(0, os.fstat(stream.fileno()).st_size - limit)
+                stream.seek(max(0, start - 1))
+                previous = stream.read(1) if start else b"\n"
+                tail = stream.read(limit)
+                if previous != b"\n":
+                    tail = tail.partition(b"\n")[2]  # Ignore a partial first line.
+                height = self.find_layer_height_from_content(tail.decode("utf-8", errors="ignore"))
+                if height is None and start:
+                    stream.seek(0)
+                    header = stream.read(limit).rpartition(b"\n")[0]
+                    height = self.find_layer_height_from_content(header.decode("utf-8", errors="ignore"))
+                return height
+        except (OSError, ValueError, AttributeError, TypeError):
+            self._plugin_logger.debug("Could not recover layer height from %s", file_path, exc_info=True)
+            return None
+
     def find_total_layers_from_content(self, file_content):
         for line in file_content.splitlines():
             if "; total layer number:" in line:
@@ -847,39 +633,6 @@ class LCD_E3V3SEPlugin(
     # -----------------------
     # Cleanup
     # -----------------------
-    def cleanup(self):
-        # Reset job timing
-        self.start_time = None
-        self.elapsed_time = None
-
-        # Reset metadata
-        self.print_time = None
-        self.progress = None
-        self.myETA = None
-
-        # Reset LCD / print state
-        self.is_lcd_ready = False
-        self.current_layer = 0
-        self.total_layers = 0
-        self.print_finish = False
-        self.sent_imagemap = False
-
-        # Reset comm helpers
-        self.printer_busy = False
-        self.get_last_chunk = False
-        self.chunk_index = 0
-        self.txLine = None
-        self.nextLineAck = False
-
-        # Stop gates (never keep the printer paused because of us)
-        self._stop_pause_gate()
-        self.thumb_rendered_event.clear()
-        self.pause_gate_thread = None
-
-        # Reset metadata thread guard
-        with self._metadata_lock:
-            self._metadata_running = False
-            self._metadata_last_file = None
 
    
     def get_update_information(self):
@@ -897,7 +650,7 @@ class LCD_E3V3SEPlugin(
 
 
 __plugin_pythoncompat__ = ">=3,<4"
-__plugin_version__ = "0.0.8"
+__plugin_version__ = "0.0.9"
 
 
 def __plugin_load__():
@@ -907,6 +660,7 @@ def __plugin_load__():
 
     global __plugin_hooks__
     __plugin_hooks__ = {
+        "octoprint.comm.protocol.scripts": __plugin_implementation__.gcode_script_hook,
         "octoprint.filemanager.preprocessor": __plugin_implementation__.file_preprocessor,
         "octoprint.comm.protocol.gcode.queuing": __plugin_implementation__.gcode_sending_handler,
         "octoprint.comm.protocol.gcode.received": __plugin_implementation__.gcode_received_handler,
