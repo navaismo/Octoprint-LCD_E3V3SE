@@ -226,6 +226,27 @@
                 title="If the slider is Enabled, OctoPrint will send the Thumbnail to the LCD, this process will take up to 2 minutes and will pause the print job until it finishes."></i>
         </div>
 
+        <div class="control-group">
+            <label class="checkbox" for="e3v3selcd-fit-thumbnail-to-area">
+                <input type="checkbox" id="e3v3selcd-fit-thumbnail-to-area"
+                    data-bind="checked: settings.plugins.LCD_E3V3SE.fit_thumbnail_to_area" />
+                Fit model to thumbnail area
+            </label>
+            <p class="help-block">Trim black or transparent margins and enlarge small previews to fill the existing
+                96×96 area while keeping the model's proportions. Disable to preserve the original framing.</p>
+        </div>
+
+        <div class="control-group">
+            <label class="checkbox" for="e3v3selcd-enable-thumbnail-fallback">
+                <input type="checkbox" id="e3v3selcd-enable-thumbnail-fallback"
+                    data-bind="checked: settings.plugins.LCD_E3V3SE.enable_thumbnail_fallback" />
+                Recover embedded thumbnails without the expected header
+            </label>
+            <p class="help-block">Use the largest embedded PNG/JPEG Base64 image, even without thumbnail markers or at other sizes.
+                The plugin fits the image into 96×96 pixels and generates the LCD drawing data.
+                Requires Enable Thumbnail. Existing uploaded files are recovered when selected again.</p>
+        </div>
+
         <br><br>
         <p>Select whether enable or not the Purge Filament Option on Pause:</p>
         <div class="switch-container m73-slider">

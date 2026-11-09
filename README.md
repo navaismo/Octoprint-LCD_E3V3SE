@@ -51,6 +51,24 @@ uses different records and flow control.
 3. Select **M73** progress and optionally enable the paused-filament purge button.
 4. Save the settings and restart OctoPrint if prompted.
 
+PNG and JPEG `thumbnail`, `thumbnail_PNG`, `thumbnail_JPG` and `thumbnail_JPEG`
+blocks at 96×96 are supported without a slicer identification header. Optionally
+enable **Recover embedded thumbnails without the expected header** to use PNG/JPEG
+Base64 comments without those markers or at other sizes. Recovery selects the
+largest valid embedded image to retain model detail before fitting it into the
+LCD's 96×96 area. The host generates the RGB565 drawing commands. A checksum/hash alone
+cannot reconstruct an image; the G-code must contain the encoded image data.
+The option defaults to off and requires G-code Preview. Files already uploaded
+are recovered and cached when selected again, without another upload.
+
+**Fit model to thumbnail area** is enabled by default. It trims transparent or
+near-black margins and scales the visible model up or down to fit 96×96 while
+preserving its aspect ratio. This makes a padded or tiny source preview readable
+without changing Marlin's drawing bounds. Disable it to preserve the slicer's
+original framing. Enlarging a small source cannot restore missing image detail;
+recovery uses a larger source when one is embedded in the G-code. Older recovery
+caches are refreshed once when the file is selected again.
+
 ![Settings](media/Settings.png)
 
 ## LCD screens

@@ -1,6 +1,7 @@
 """Exercise the real OctoPrint plugin class with a counted job hold."""
 import threading
 import io
+import base64
 import json
 from pathlib import Path
 import tempfile
@@ -256,6 +257,132 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNone(self.plugin.find_layer_height_from_content("G1 X0"))
         self.assertEqual(self.plugin.find_layer_height_from_content("; layer_height = 0.24"),.24)
         self.assertEqual(self.plugin.find_total_layers_from_content(";LAYER_COUNT:123"),"123")
+
+    def test_thumbnail_fallback_repairs_cached_missing_or_invalid_preview(self):
+        from PIL import Image
+        encoded = io.BytesIO()
+        Image.new("RGB", (192, 96), "red").save(encoded, format="PNG")
+        payload = base64.b64encode(encoded.getvalue()).decode("ascii")
+        for old_preview in (None, "invalid"):
+            with self.subTest(old_preview=old_preview), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                gcode = root / "model.gcode"
+                gcode.write_text("; " + payload + "\nG28\n")
+                self.plugin.metadata_dir = folder
+                metadata = {"thumb_data": old_preview, "layer_height": .2,
+                            "total_layers": 123, "print_time": 302}
+                cache = root / "model.gcode.json"
+                cache.write_text(json.dumps(metadata))
+                self.plugin.load_metadata_from_json = module.LCD_E3V3SEPlugin.load_metadata_from_json.__get__(self.plugin)
+                paths = []
+                self.plugin._file_manager = SimpleNamespace(
+                    path_on_disk=lambda origin, path: paths.append((origin, path)) or str(gcode))
+                self.plugin.file_path = "nested/model.gcode"
+                rendered = []
+                self.plugin._draw.render = rendered.append
+                self.assertTrue(self.plugin.get_print_metadata("model.gcode", True))
+                saved = json.loads(cache.read_text())
+                self.assertEqual(saved["thumb_data"], payload)
+                self.assertTrue(saved["thumbnail_fallback_checked"])
+                self.assertEqual(saved["thumbnail_fallback_version"], module.EXTRACTION_VERSION)
+                self.assertEqual(saved["print_time"], 302)
+                self.assertEqual(paths, [("local", "nested/model.gcode")])
+                expected = module.card_operations(module.rgb565(self.plugin.decode_base64_image(payload)))
+                self.assertEqual(rendered, [expected])
+                paths.clear()
+                self.assertTrue(self.plugin.get_print_metadata("model.gcode", True))
+                self.assertEqual(paths, [])
+
+    def test_thumbnail_recovery_upgrades_old_checked_cache_once(self):
+        from PIL import Image
+        encoded = io.BytesIO()
+        Image.new("RGB", (16, 16), "white").save(encoded, format="PNG")
+        old = base64.b64encode(encoded.getvalue()).decode("ascii")
+        encoded = io.BytesIO()
+        Image.new("RGB", (300, 400), "white").save(encoded, format="PNG")
+        large = base64.b64encode(encoded.getvalue()).decode("ascii")
+        metadata = {"layer_height": .2, "thumb_data": old, "thumbnail_fallback_checked": True}
+        self.plugin.load_metadata_from_json = lambda name: dict(metadata)
+        reads, rendered = [], []
+        self.plugin.find_thumbnail_from_file = lambda path: reads.append(path) or (large, True)
+        self.plugin.save_metadata_to_json = lambda name, value: metadata.update(value)
+        self.plugin._draw.render = rendered.append
+        for _ in range(2):
+            self.assertTrue(self.plugin.get_print_metadata("test.gcode", True))
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(metadata["thumb_data"], large)
+        self.assertEqual(metadata["thumbnail_fallback_version"], module.EXTRACTION_VERSION)
+        expected = module.card_operations(module.rgb565(self.plugin.decode_base64_image(large), fit_model=True))
+        self.assertEqual(rendered, [expected, expected])
+
+    def test_fit_setting_controls_framing_of_existing_cached_thumbnail(self):
+        from PIL import Image
+        encoded = io.BytesIO()
+        Image.new("RGB", (16, 16), "white").save(encoded, format="PNG")
+        payload = base64.b64encode(encoded.getvalue()).decode("ascii")
+        self.plugin.load_metadata_from_json = lambda name: {"layer_height": .2, "thumb_data": payload}
+        self.assertTrue(self.plugin.get_settings_defaults()["fit_thumbnail_to_area"])
+        rendered = []
+        self.plugin._draw.render = rendered.append
+        for fit in (False, True):
+            self.plugin._settings = SimpleNamespace(get=lambda key: fit if key == ["fit_thumbnail_to_area"] else False)
+            self.assertTrue(self.plugin.get_print_metadata("test.gcode", True))
+        expected = [module.card_operations(module.rgb565(self.plugin.decode_base64_image(payload), fit_model=fit))
+                    for fit in (False, True)]
+        self.assertEqual(rendered, expected)
+        self.assertNotEqual(*rendered)
+
+    def test_thumbnail_fallback_requires_both_settings(self):
+        self.assertFalse(self.plugin.get_settings_defaults()["enable_thumbnail_fallback"])
+        self.plugin.load_metadata_from_json = lambda name: {"layer_height": .2}
+        self.plugin.find_thumbnail_from_file = lambda *args: self.fail("Disabled fallback must not read G-code")
+        self.plugin._draw.render = lambda ops: None
+        self.plugin._settings = SimpleNamespace(get=lambda key: False)
+        self.assertTrue(self.plugin.get_print_metadata("test.gcode", True))
+        self.plugin._settings = SimpleNamespace(get=lambda key: True)
+        self.assertTrue(self.plugin.get_print_metadata("test.gcode", False))
+
+    def test_missing_embedded_image_is_checked_once_but_read_errors_can_retry(self):
+        for checked in (False, True):
+            with self.subTest(checked=checked):
+                metadata = {"layer_height": .2}
+                self.plugin.load_metadata_from_json = lambda name: dict(metadata)
+                reads, saves = [], []
+                self.plugin.find_thumbnail_from_file = lambda path: reads.append(path) or (None, checked)
+                self.plugin.save_metadata_to_json = lambda name, value: (saves.append(name), metadata.update(value))
+                self.plugin._draw.render = lambda ops: None
+                self.assertTrue(self.plugin.get_print_metadata("test.gcode", True))
+                self.assertTrue(self.plugin.get_print_metadata("test.gcode", True))
+                self.assertEqual(len(reads), 1 if checked else 2)
+                self.assertEqual(saves, ["test.gcode"] if checked else [])
+
+    def test_cancelled_thumbnail_recovery_does_not_save_or_draw(self):
+        self.plugin.load_metadata_from_json = lambda name: {"layer_height": .2}
+        def recover(path):
+            self.plugin._render_generation += 1
+            return None, True
+        self.plugin.find_thumbnail_from_file = recover
+        self.plugin.save_metadata_to_json = lambda *args: self.fail("Cancelled recovery must not save")
+        self.plugin._draw.render = lambda ops: self.fail("Cancelled recovery must not draw")
+        self.assertFalse(self.plugin.get_print_metadata("test.gcode", True))
+        self.assertEqual(self.commands, [])
+
+    def test_upload_thumbnail_fallback_setting_is_persisted_with_metadata(self):
+        from PIL import Image
+        encoded = io.BytesIO()
+        Image.new("RGB", (300, 400), "red").save(encoded, format="PNG")
+        payload = base64.b64encode(encoded.getvalue()).decode("ascii")
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as folder:
+                self.plugin.metadata_dir = folder
+                self.plugin._settings = SimpleNamespace(get=lambda key: enabled)
+                upload = SimpleNamespace(filename="preview.gcode", stream=lambda: io.BytesIO(
+                    ("; " + payload + "\nG28\n").encode("ascii")))
+                with patch.object(module.octoprint.filemanager, "valid_file_type", return_value=True):
+                    self.assertIs(self.plugin.file_preprocessor("preview.gcode", upload, None, None, True), upload)
+                saved = json.loads((Path(folder) / "preview.gcode.json").read_text())
+                self.assertEqual(saved["thumb_data"], payload if enabled else None)
+                self.assertEqual(saved["thumbnail_fallback_checked"], enabled)
 
 if __name__ == "__main__":
     unittest.main()

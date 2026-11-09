@@ -87,6 +87,49 @@ class RasterTests(unittest.TestCase):
         image=Image.new("RGB",(192,192),(255,255,255))
         self.assertEqual(set(card.rgb565(image)),{65535})
 
+    def test_fit_model_removes_margins_without_changing_lcd_region(self):
+        from PIL import Image, ImageDraw
+        for mode, background in (("RGB", "black"), ("RGBA", (255, 0, 0, 0))):
+            with self.subTest(mode=mode):
+                image = Image.new(mode, (300, 400), background)
+                ImageDraw.Draw(image).rectangle((75, 135, 206, 283), fill="white")
+                original = card.rgb565(image)
+                fitted = card.rgb565(image, fit_model=True)
+                def visible_bounds(pixels):
+                    visible = [i for i, value in enumerate(pixels) if value > 0x8000]
+                    return (max(i % 96 for i in visible) - min(i % 96 for i in visible) + 1,
+                            max(i // 96 for i in visible) - min(i // 96 for i in visible) + 1)
+                before_width, before_height = visible_bounds(original)
+                after_width, after_height = visible_bounds(fitted)
+                self.assertLess(before_height, 40)
+                self.assertGreater(after_height, 90)
+                self.assertGreater(after_width, 80)
+                self.assertAlmostEqual(after_width / after_height, 132 / 149, delta=.04)
+                self.assertEqual(len(fitted), 96 * 96)
+                rendered = replay(card.card_operations(fitted))
+                for y in range(96):
+                    self.assertEqual(rendered[(26+y)*240+12:(26+y)*240+108], fitted[y*96:y*96+96])
+
+    def test_fit_model_enlarges_tiny_previews_and_can_be_disabled(self):
+        from PIL import Image
+        image = Image.new("RGB", (16, 16), "white")
+        self.assertEqual(sum(value != 0 for value in card.rgb565(image)), 16 * 16)
+        self.assertEqual(set(card.rgb565(image, fit_model=True)), {65535})
+
+    def test_fit_model_ignores_faint_jpeg_margin_noise(self):
+        from PIL import Image, ImageDraw
+        image = Image.new("RGB", (96, 96), (8, 8, 8))
+        ImageDraw.Draw(image).rectangle((30, 32, 62, 69), fill="red")
+        fitted = card.rgb565(image, fit_model=True)
+        red_pixels = [i for i, value in enumerate(fitted) if value & 0xF800 > 0x8000]
+        self.assertGreater(max(i // 96 for i in red_pixels) - min(i // 96 for i in red_pixels), 85)
+
+    def test_fit_blank_or_transparent_image_remains_empty(self):
+        from PIL import Image
+        for image in (Image.new("RGB", (300, 400), "black"),
+                      Image.new("RGBA", (16, 16), (255, 255, 255, 0))):
+            self.assertEqual(set(card.rgb565(image, fit_model=True)), {0})
+
 
 class ClientTests(unittest.TestCase):
     def peer(self, drop=False):

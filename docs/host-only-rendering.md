@@ -32,7 +32,13 @@ produce a small MODEL placeholder and the same usable native controls.
 ## Graphics and metadata
 
 Images are resized/letterboxed to 96x96, composited onto black and converted to
-RGB565 on the host. Horizontal runs merge vertically into rectangles; disjoint
+RGB565 on the host. The default **Fit model to thumbnail area** option first
+trims transparent/near-black margins and fits the visible model, enlarging small
+previews as needed while preserving proportions. Disable it to retain original
+framing and downscale only. Optional embedded-image recovery selects the largest
+valid source, including images without thumbnail markers; older recovery caches
+are refreshed once to upgrade the source. The output remains 96x96 in either case.
+Horizontal runs merge vertically into rectangles; disjoint
 rectangles are grouped by color. Black pixels are omitted after initialization.
 A bounded 19-pixel STRIP fallback avoids sending a COLOR/RECT pair in host G-code
 for every high-entropy pixel. It is selected only when it cannot increase the

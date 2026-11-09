@@ -96,11 +96,25 @@ def card_operations(pixels=None):
     return ops
 
 
-def rgb565(image):
+def rgb565(image, fit_model=False):
     """Resize on the host, compositing alpha over the initialized black region."""
-    from PIL import Image
+    from PIL import Image, ImageOps
     source = image.convert("RGBA")
-    source.thumbnail((96,96), Image.Resampling.LANCZOS)
+    if fit_model:
+        background = Image.new("RGBA", source.size, (0, 0, 0, 255))
+        background.alpha_composite(source)
+        source = background
+        # Ignore faint JPEG noise in black/transparent margins. Keep one source
+        # pixel around the visible model to retain its antialiased silhouette.
+        bounds = source.convert("RGB").point(lambda value: 255 if value > 16 else 0).getbbox()
+        if bounds:
+            left, top, right, bottom = bounds
+            source = source.crop((max(0, left - 1), max(0, top - 1),
+                                  min(source.width, right + 1), min(source.height, bottom + 1)))
+        # Unlike thumbnail(), contain() also enlarges a small recovered preview.
+        source = ImageOps.contain(source, (96, 96), Image.Resampling.LANCZOS)
+    else:
+        source.thumbnail((96,96), Image.Resampling.LANCZOS)
     canvas = Image.new("RGBA",(96,96),(0,0,0,255))
     canvas.alpha_composite(source,((96-source.width)//2,(96-source.height)//2))
     return [((r*31//255)<<11)|((g*63//255)<<5)|(b*31//255)
