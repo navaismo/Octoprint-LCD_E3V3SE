@@ -100,6 +100,23 @@ without asking OctoPrint to cancel an idle printer.
 If the connection is physically gone, resuming a serial job requires reconnecting
 the host; display ownership and encoder handling do not wait for that connection.
 
+## Host pause state and M117
+
+PrintPaused sends M9000 R1 and PrintResumed sends M9000 R0. These are event
+notifications, not polling. Marlin updates its LCD pause flag, native icon and
+filename title without opening S1, resetting progress or resending the image.
+Encoder highlighting uses the same host pause flag. If Tune or a firmware
+prompt is open, it keeps its screen and uses the updated flag on return. These
+notifications do not resume motion, answer M876 or release a firmware pause.
+
+During a host print or pause, M117 uses the title bar for 15 seconds. It preserves
+the job filename, thumbnail, progress, controls and screen state. A new message
+restarts the timeout. Marlin reuses its existing scrolling-title buffer, bounds
+the displayed window and restores the filename through its normal update loop;
+there is no blocking 15-second wait. Tune and safety prompts keep their own
+screen; a still-current message can appear on return. MAIN, a new card or finish
+clears a pending notification. Idle M117 retains the native info/Back window.
+
 ## Wire format
 
 `M9001 Q` returns `M9001 CAPS 2 42 240 320 00000000 0000`.

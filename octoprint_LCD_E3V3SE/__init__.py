@@ -382,6 +382,9 @@ class LCD_E3V3SEPlugin(
                 return  # The synchronous start hook already owns this selection.
             self._select_render_file(name, path)
             self._start_metadata_thread_once(self.file_name, self._settings.get(["enable_gcode_preview"]))
+        elif event in ("PrintPaused", "PrintResumed"):
+            # State notification only: do not reopen the card or reset progress.
+            self.send_M9000_cmd("R1" if event == "PrintPaused" else "R0")
         elif event == "PrintStarted":
             self.start_time = time.time()
         elif event == "PrintDone":

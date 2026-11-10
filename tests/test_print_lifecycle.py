@@ -135,6 +135,21 @@ class LifecycleTests(unittest.TestCase):
         self.plugin.gcode_received_handler(None,"M9000 resume-job")
         self.assertEqual(self.pause_calls,[])
 
+    def test_host_pause_resume_notifies_lcd_without_reopening_or_resuming_job(self):
+        self.plugin.on_event("PrintPaused",{})
+        self.plugin.on_event("PrintResumed",{})
+        self.assertEqual(self.commands,["M9000 R1","M9000 R0"])
+        self.assertEqual(self.pause_calls,[])
+        self.assertEqual(self.holds,1)
+        self.assertFalse(any(c.startswith("M9000 S") for c in self.commands))
+
+    def test_resume_state_notification_does_not_answer_firmware_prompt(self):
+        self.plugin._purge.firmware_pause=True
+        self.plugin.on_event("PrintResumed",{})
+        self.assertEqual(self.commands,["M9000 R0"])
+        self.assertEqual(self.pause_calls,[])
+        self.assertTrue(self.plugin._purge.firmware_pause)
+
     def test_native_pause_resume_cancel_keep_existing_host_actions(self):
         self.plugin.gcode_received_handler(None,"M9000 pause-job")
         self.plugin.gcode_received_handler(None,"M9000 resume-job")
