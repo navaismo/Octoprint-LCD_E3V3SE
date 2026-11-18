@@ -779,7 +779,7 @@ class LCD_E3V3SEPlugin(
 
 
 __plugin_pythoncompat__ = ">=3,<4"
-__plugin_version__ = "0.0.9"
+__plugin_version__ = "0.1.1"
 
 
 def __plugin_load__():
