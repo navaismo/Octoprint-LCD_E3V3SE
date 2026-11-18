@@ -3,7 +3,7 @@
 Send print details and a 96×96 thumbnail to the Ender-3 V3 SE LCD through the
 printer's normal OctoPrint connection. MeatPack and native M600 prompts remain.
 
-**main_cleanup** is the maintained implementation for OctoPrint **1.11.x and
+**main** is the maintained unified implementation for OctoPrint **1.11.x and
 2.0.x**, with automatic selection of the existing Marlin thumbnail protocols:
 
 | Firmware | Protocol |
@@ -41,7 +41,7 @@ See the [compatibility audit and four-way validation guide](docs/unified-protoco
   DWIN_RENDER_THUMBNAIL; Pure Host v2 also requires M9001_DRAW_PROTOCOL.
   Firmware and TFT resources must match the printer. The plugin does not flash
   firmware or change the existing native LCD layout.
-- The matching plugin `main_cleanup`, OctoPrint and Pillow (declared dependency).
+- The matching plugin `main`, OctoPrint and Pillow (declared dependency).
 - Slicer M73 progress. M73 L supplies actual layer progress; M73 P/R supplies
   percentage/time-left. [Slicer setup](https://github.com/navaismo/Octoprint-LCD_E3V3SE/wiki/Enable-M73-Support).
 - Compatible TJC LCD resources for the new splash, buttons and cube artwork.
@@ -49,7 +49,7 @@ See the [compatibility audit and four-way validation guide](docs/unified-protoco
 
 ## Installation
 
-1. Obtain the `main_cleanup` plugin ZIP and matching firmware from the matrix.
+1. Obtain the `main` plugin ZIP and matching firmware from the matrix.
 2. In OctoPrint, open **Settings → Plugin Manager → Get More → Install from File**.
 3. Install the ZIP and restart OctoPrint.
 4. Update Marlin using the printer's existing firmware-update procedure.
@@ -93,27 +93,22 @@ original framing. Enlarging a small source cannot restore missing image detail;
 recovery uses a larger source when one is embedded in the G-code. Older recovery
 caches are refreshed once when the file is selected again.
 
-![Settings](media/Settings.png)
+![Settings](media/Settings2.png)
 
 ## LCD screens
 
-The references below come from the local
-[TFT project](https://github.com/eduard-sukharev/TJC-firmware-reverse-engineering)
-working copy. They are individual LCD resources, not full-screen host uploads.
-[Sources and attribution](docs/screens/README.md).
 
-<img src="docs/screens/splash.png" width="160" alt="OctoPrint and Marlin splash reference">
-
-Native MAIN retains its encoder selection and menus:
-
-<img src="docs/screens/main-print.png" width="86" alt="Print reference"> <img src="docs/screens/main-prepare.png" width="86" alt="Prepare reference"> <img src="docs/screens/main-control.png" width="86" alt="Control reference"> <img src="docs/screens/main-leveling.png" width="86" alt="Leveling reference">
 
 On Pure Host v2, MAIN Print displays **Upload to Host / and start from there**, with working Back.
 The print card keeps the filename on top, a green-framed thumbnail on the left,
 the native cube on the right, four metadata rows below, and native controls and
 temperatures at the bottom.
 
-<img src="docs/screens/progress-cube.png" width="92" alt="Cube progress resource at zero percent">
+> [!IMPORTANT]
+> LCD Only renders the print Job if it is in Main Menu or Print Menu, the rendering from any other Menu is cancelled by design.
+
+
+<img src="media/skin-octoprint-collage.jpg" width="90%" >
 
 | Field | Source and behavior | Value color |
 |---|---|---|
@@ -187,6 +182,29 @@ seconds per field, and only changed values are drawn.
 
 M9001 CRC protects drawing records. It does not correct normal G-code checksum
 mismatches or establish that USB/UART traffic cannot be lost.
+
+
+## Purging a paused print
+
+The optional purge button asks the backend to extrude 15 mm at 150 mm/min.
+It preserves the E coordinate, extrusion mode and feedrate and keeps the motors
+enabled. Units must be confirmed as millimeters; unknown extrusion state is
+rejected rather than assuming M82 or M83. The plugin observes sent G-code and
+reads M503/M114 during an ordinary pause. These read-only commands do not move
+or reconfigure the printer. Reconnects clear the saved state.
+
+During a firmware filament change, the button uses M876 S0 only when Marlin
+offers Purge more. Marlin then controls the purge length and preserves its own
+resume position. Earlier insertion/heating prompts must be answered normally.
+Purge requires printer-control permission and an enabled purge option; it is
+unavailable during printing or the initial rendering job hold. Resume still belongs
+to OctoPrint and the configured pause/resume scripts.
+
+Run the offline regression checks with `python -m unittest discover -s tests`
+and `node tests/test_purge_frontend.js`. Printer validation is still needed for
+absolute/relative extrusion, repeated purges and M600 prompt handling.
+
+
 
 ## Communication sequence
 
@@ -291,23 +309,3 @@ This project is licensed under the AGPL license.
 
 ## Author
 Created by navaismo
-
-## Purging a paused print
-
-The optional purge button asks the backend to extrude 15 mm at 150 mm/min.
-It preserves the E coordinate, extrusion mode and feedrate and keeps the motors
-enabled. Units must be confirmed as millimeters; unknown extrusion state is
-rejected rather than assuming M82 or M83. The plugin observes sent G-code and
-reads M503/M114 during an ordinary pause. These read-only commands do not move
-or reconfigure the printer. Reconnects clear the saved state.
-
-During a firmware filament change, the button uses M876 S0 only when Marlin
-offers Purge more. Marlin then controls the purge length and preserves its own
-resume position. Earlier insertion/heating prompts must be answered normally.
-Purge requires printer-control permission and an enabled purge option; it is
-unavailable during printing or the initial rendering job hold. Resume still belongs
-to OctoPrint and the configured pause/resume scripts.
-
-Run the offline regression checks with `python -m unittest discover -s tests`
-and `node tests/test_purge_frontend.js`. Printer validation is still needed for
-absolute/relative extrusion, repeated purges and M600 prompt handling.
