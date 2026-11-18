@@ -113,6 +113,10 @@ class LCD_E3V3SEPlugin(
     def is_template_autoescaped(self):
         return True
 
+    # Required by new OctoPrint versions
+    def is_api_protected(self):
+        return True
+
     # -----------------------
     # Logging / Settings
     # -----------------------
@@ -224,7 +228,7 @@ class LCD_E3V3SEPlugin(
     # -----------------------
     # Upload preprocessor
     # -----------------------
-    def file_preprocessor(self, path, file_object, links, printer_profile, allow_overwrite, *args, **kwargs):
+    def file_preprocessor(self,path,file_object,links=None,printer_profile=None,allow_overwrite=False,*args,**kwargs):
         """Intercept file uploads and generate a metadata JSON for fast printing."""
         self._plugin_logger.info(f">>>>>> PreProcessing file: {file_object}")
         self._plugin_logger.info(f">>>>>> PreProcessing path: {path}")
