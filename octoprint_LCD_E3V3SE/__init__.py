@@ -15,6 +15,9 @@ from flask import jsonify
 from octoprint.access.permissions import Permissions
 from .purge import PurgeState
 from .drawing import DrawingClient
+from .drawing_legacy import LegacyDrawingClient
+from .firmware_caps import FirmwareCapabilities
+from .firmware_commands import FirmwareCommands
 from .print_card import card_operations, rgb565
 from .thumbnails import EXTRACTION_VERSION, extract_thumbnail
 
@@ -38,13 +41,18 @@ class LCD_E3V3SEPlugin(
 ):
     def __init__(self):
         self._purge = PurgeState()
-        self._draw = DrawingClient(lambda cmd: self._printer.commands(cmd, tags={"ignore_blocker"}))
+        self._connection_lock = threading.RLock()
+        self._connection_generation = 0
+        self._caps = FirmwareCapabilities()
+        self._active_protocol = None
+        self._new_render_clients()
         self._render_generation = 0
         self._render_attempted = False
         self._pending_render = None
         self._rendering_generation = -1
         self._hold_lock = threading.RLock()
         self._hold_owned = False
+        self._hold_connection = None
 
         # --- Core state ---
         self.plugin_data_folder = None
@@ -87,6 +95,10 @@ class LCD_E3V3SEPlugin(
 
     def get_api_commands(self):
         return {"purge_filament": []}
+
+    def on_api_get(self, request):
+        return jsonify(protocol=self._caps.status(), selected=self._active_protocol,
+                       preference=self._settings.get(["lcd_protocol"]) or "auto")
 
     def on_api_command(self, command, data):
         if not Permissions.CONTROL.can():
@@ -150,6 +162,7 @@ class LCD_E3V3SEPlugin(
             enable_gcode_preview=True,       # Send and render G-code thumbnail
             enable_thumbnail_fallback=False, # Recover images without standard markers
             fit_thumbnail_to_area=True,     # Trim empty margins and fit the model
+            lcd_protocol="auto",            # Auto, validated legacy v1 or CAPS v2
             progress_type="m73_progress",    # Progress based on M73
             enable_purge_filament=False      # Show purge popup on pause
         )
@@ -190,6 +203,7 @@ class LCD_E3V3SEPlugin(
         self._plugin_logger.info(f"Recover Embedded Thumbnail: {self._settings.get(['enable_thumbnail_fallback'])}")
         self._plugin_logger.info(f"Fit Thumbnail Model: {self._settings.get(['fit_thumbnail_to_area'])}")
         self._plugin_logger.info(f"Enable Purge Filament: {self._settings.get(['enable_purge_filament'])}")
+        self._plugin_logger.info("LCD protocol preference: %s", self._settings.get(["lcd_protocol"]))
 
     # -----------------------
     # Metadata JSON Helpers
@@ -214,8 +228,13 @@ class LCD_E3V3SEPlugin(
         try:
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
+            if not isinstance(metadata, dict):
+                raise ValueError("Metadata cache must contain a JSON object")
             self._plugin_logger.info(f"Metadata loaded from {metadata_path}")
             return metadata
+        except FileNotFoundError:
+            self._plugin_logger.debug("Metadata cache miss for %s", filename)
+            return None
         except Exception as e:
             self._plugin_logger.error(
                 f"{self.get_current_function_name()}: Failed to load metadata from {metadata_path}: {e}"
@@ -228,7 +247,8 @@ class LCD_E3V3SEPlugin(
     # -----------------------
     # Upload preprocessor
     # -----------------------
-    def file_preprocessor(self,path,file_object,links=None,printer_profile=None,allow_overwrite=False,*args,**kwargs):
+    def file_preprocessor(self, path, file_object, links=None, printer_profile=None,
+                          allow_overwrite=False, *args, **kwargs):
         """Intercept file uploads and generate a metadata JSON for fast printing."""
         self._plugin_logger.info(f">>>>>> PreProcessing file: {file_object}")
         self._plugin_logger.info(f">>>>>> PreProcessing path: {path}")
@@ -261,7 +281,7 @@ class LCD_E3V3SEPlugin(
             "processed": True
         }
 
-        self._plugin_logger.info(f">>>>>> PreProcessing metadata: {metadata}")
+        self._log_metadata(file_name, metadata)
 
         try:
             self.save_metadata_to_json(file_name, metadata)
@@ -277,6 +297,66 @@ class LCD_E3V3SEPlugin(
     # -----------------------
     # Thread guards
     # -----------------------
+    def _new_render_clients(self):
+        connection = self._connection_generation
+        send = lambda cmd: self._send_drawing_command(cmd, connection)
+        self._draw = DrawingClient(send)
+        self._legacy = LegacyDrawingClient(send, self._caps.confirm_legacy)
+
+    def _send_drawing_command(self, command, connection):
+        with self._connection_lock:
+            if connection != self._connection_generation:
+                raise RuntimeError("Discarded drawing command from an old connection")
+            self._printer.commands(command, tags={"ignore_blocker"})
+
+    def _reset_connection(self):
+        # A disconnected OctoPrint comm instance discards its counted holds.
+        # Never let an old worker decrement the replacement connection's hold.
+        with self._connection_lock:
+            self._connection_generation += 1
+        self._caps.reset()
+        self._draw.cancel(disconnected=True)
+        self._legacy.cancel(disconnected=True)
+        with self._metadata_lock:
+            self._render_generation += 1
+            self._pending_render = None
+            self._render_attempted = False
+            with self._hold_lock:
+                self._hold_owned = False
+                self._hold_connection = None
+                self.pause_gate_active = False
+        self._active_protocol = None
+
+    def _publish_protocol_status(self):
+        status = self._caps.status()
+        self._plugin_logger.info("LCD protocol: %s; selected=%s", status, self._active_protocol)
+        self._plugin_manager.send_plugin_message(
+            self._identifier, dict(type="protocol_status", protocol=status))
+
+    def _log_metadata(self, filename, metadata):
+        thumbnail = metadata.get("thumb_data") or ""
+        self._plugin_logger.info(
+            "Metadata %s: thumbnail=%s encoded_size=%d layers=%s height=%s estimate_min=%s protocol=%s",
+            filename, bool(thumbnail), len(thumbnail) if isinstance(thumbnail, (str, bytes)) else 0,
+            metadata.get("total_layers"),
+            metadata.get("layer_height"), metadata.get("print_time"), self._active_protocol)
+
+    def _recover_metadata(self, file_name, file_path):
+        try:
+            path = self._file_manager.path_on_disk("local", file_path)
+            with open(path, "r", encoding="utf-8", errors="ignore") as stream:
+                header = stream.read(256 * 1024)
+            progress, estimated = self.find_first_m73_from_content(header)
+            metadata = dict(file_name=file_name, file_path=file_path,
+                            total_layers=self.find_total_layers_from_content(header),
+                            layer_height=self.find_layer_height_from_file(file_path),
+                            print_time=estimated, progress=progress, current_layer=0,
+                            thumb_data=self.extract_thumbnail_from_content(header), processed=True)
+            return metadata
+        except (OSError, ValueError, AttributeError, TypeError):
+            self._plugin_logger.debug("Could not recover metadata from %s", file_path, exc_info=True)
+            return {}
+
     def _start_metadata_thread_once(self, file_name, thumb_enabled):
         if not file_name or self._render_attempted:
             return
@@ -284,7 +364,8 @@ class LCD_E3V3SEPlugin(
             if self._metadata_running and self._rendering_generation == self._render_generation:
                 return
             self._pending_render = (file_name, thumb_enabled, self._render_generation)
-            if self._metadata_running:
+            if (self._metadata_running and self._hold_owned
+                    and self._hold_connection == self._connection_generation):
                 return
             with self._hold_lock:
                 if not self._printer.set_job_on_hold(True, blocking=False):
@@ -293,7 +374,10 @@ class LCD_E3V3SEPlugin(
                     self._pending_render = None
                     return
                 self._hold_owned = True
+                self._hold_connection = self._connection_generation
                 self.pause_gate_active = True
+            if self._metadata_running:
+                return
             self._metadata_running = True
 
         def worker():
@@ -327,10 +411,12 @@ class LCD_E3V3SEPlugin(
         with self._hold_lock:
             if self._hold_owned:
                 try:
-                    self._printer.set_job_on_hold(False)
+                    if self._hold_connection == self._connection_generation:
+                        self._printer.set_job_on_hold(False)
                 except RuntimeError:
                     pass  # The connection and its hold counter were discarded.
                 self._hold_owned = False
+                self._hold_connection = None
             self.pause_gate_active = False
 
     def _select_render_file(self, name, path):
@@ -339,7 +425,7 @@ class LCD_E3V3SEPlugin(
         self.sent_imagemap = self.is_lcd_ready = False
         self._render_attempted = False
         version = self._draw.version
-        self._draw = DrawingClient(lambda cmd: self._printer.commands(cmd, tags={"ignore_blocker"}))
+        self._new_render_clients()
         self._draw.version = version
 
     def gcode_script_hook(self, comm, script_type, script_name, *args, **kwargs):
@@ -365,6 +451,8 @@ class LCD_E3V3SEPlugin(
             self._render_generation += 1
             self._pending_render = None
         self._draw.cancel(disconnected=not self._printer.is_operational())
+        self._legacy.cancel(disconnected=not self._printer.is_operational())
+        self._caps.wake()
         self.thumb_rendered_event.set()
 
     # -----------------------
@@ -374,26 +462,42 @@ class LCD_E3V3SEPlugin(
         if event in ("Connected", "Disconnected", "Error", "PrintCancelled", "PrintDone", "PrintFailed"):
             self._purge.reset()
         if event == "Connected":
+            self._reset_connection()
+            self._caps = FirmwareCapabilities()
+            self._caps.connected()
+            self._new_render_clients()
             self.send_M9000_cmd("A1")
             self._draw.connected()
-        elif event in ("Disconnected", "Error", "PrintCancelled", "PrintFailed"):
+            self._publish_protocol_status()
+        elif event == "Disconnected":
+            self._stop_pause_gate()
+            self._release_render_hold()
+            self._reset_connection()
+            self._publish_protocol_status()
+        elif event in ("Error", "PrintCancelled", "PrintFailed"):
             self._stop_pause_gate()
         elif event == "FileSelected":
             if payload.get("origin") == "sdcard":
                 return
             name, path = payload.get("name"), payload.get("path")
-            if (self._metadata_running or self._printer.is_printing()) and name == self.file_name and path == self.file_path:
+            if (not self._draw.cancelled and name == self.file_name and path == self.file_path
+                    and (self._metadata_running or self._render_attempted or self._printer.is_printing())):
                 return  # The synchronous start hook already owns this selection.
             self._select_render_file(name, path)
             self._start_metadata_thread_once(self.file_name, self._settings.get(["enable_gcode_preview"]))
         elif event in ("PrintPaused", "PrintResumed"):
             # State notification only: do not reopen the card or reset progress.
+            if event == "PrintPaused" and self._metadata_running:
+                self._stop_pause_gate()
             self.send_M9000_cmd("R1" if event == "PrintPaused" else "R0")
         elif event == "PrintStarted":
             self.start_time = time.time()
         elif event == "PrintDone":
             self._stop_pause_gate()
-            self.send_M9000_cmd("F1")
+            elapsed = max(0, min(71582788, int((time.time() - self.start_time) / 60))) if self.start_time else 0
+            FirmwareCommands(self._active_protocol, self.send_M9000_cmd,
+                             lambda cmd: self._printer.commands(cmd, tags={"ignore_blocker"})).finish(
+                                 elapsed, self.total_layers or 0)
             self.print_finish = True
         elif event == "PrinterStateChanged":
             self._last_state_id = payload.get("state_id", "UNKNOWN")
@@ -408,8 +512,12 @@ class LCD_E3V3SEPlugin(
     def get_print_metadata(self, file_name, thumb_enabled, generation=None):
         generation = self._render_generation if generation is None else generation
         draw = self._draw
+        legacy, caps = self._legacy, self._caps
+        connection = self._connection_generation
         file_path = self.file_path or file_name
-        md = self.load_metadata_from_json(file_name) or {}
+        cached = self.load_metadata_from_json(file_name)
+        md = cached if cached is not None else self._recover_metadata(file_name, file_path)
+        dirty = cached is None and bool(md)
         if generation != self._render_generation or self._purge.firmware_pause:
             return False
         total = md.get("total_layers")
@@ -431,7 +539,7 @@ class LCD_E3V3SEPlugin(
             if recovered is not None:
                 height = round(recovered * 1000)
                 md["layer_height"] = recovered
-                self.save_metadata_to_json(file_name, md)
+                dirty = True
         if (thumb_enabled and self._settings.get(["enable_thumbnail_fallback"])
                 and md.get("thumbnail_fallback_version") != EXTRACTION_VERSION):
             recovered, checked = self.find_thumbnail_from_file(file_path)
@@ -442,7 +550,9 @@ class LCD_E3V3SEPlugin(
                 md["thumbnail_fallback_version"] = EXTRACTION_VERSION
                 if recovered:
                     md["thumb_data"] = recovered
-                self.save_metadata_to_json(file_name, md)
+                dirty = True
+        if dirty and generation == self._render_generation and not draw.cancelled:
+            self.save_metadata_to_json(file_name, md)
         pixels = None
         if thumb_enabled and md.get("thumb_data"):
             try:
@@ -453,22 +563,37 @@ class LCD_E3V3SEPlugin(
         operations = card_operations(pixels)
         if generation != self._render_generation or draw.cancelled:
             return False
+        # DrawingClient.version is set only by a validated CAPS response. Keep
+        # this already-proven connection capability when selecting another file.
+        if draw.version == 2:
+            caps.received("M9001 CAPS 2 42 240 320")
+        protocol = caps.select(self._settings.get(["lcd_protocol"]), lambda: draw.cancelled)
+        if generation != self._render_generation or draw.cancelled or self._purge.firmware_pause:
+            return False
+        self._active_protocol = protocol
+        self._publish_protocol_status()
+        self._log_metadata(file_name, md)
         name = "".join(c if 32 <= ord(c) < 127 and c not in ";*" else " " for c in (file_name or "Print")).replace('"', "'").replace("\n", " ").replace("\r", " ")[:49]
-        self.send_M9000_cmd('N"' + name + '"')
-        self.send_M9000_cmd("L{} H{}".format(total, height))
         estimated = md.get("print_time")
         try:
             estimated = max(0, min(0xFFFFFFFF, int(float(estimated or 0))))
         except (ValueError, TypeError, OverflowError):
             estimated = 0
         # Snapshot the job's initial estimate independently of live M73 R updates.
-        self.send_M9000_cmd("E{}".format(estimated))
-        self._printer.commands("M73 R{}".format(estimated), tags={"ignore_blocker"})
-        self.send_M9000_cmd("S1")
-        draw.render(operations)
+        send = lambda cmd: self._send_drawing_command(cmd, connection)
+        firmware = FirmwareCommands(protocol, lambda value: send("M9000 " + value), send)
+        firmware.metadata(name, total, height, estimated)
+        self.total_layers = total
+        if protocol == "v2":
+            if draw.version != 2:
+                draw.received("M9001 CAPS 2 42 240 320")
+            draw.render(operations)
+        elif pixels is not None:
+            legacy.render(pixels)
+            self._publish_protocol_status()
         if generation != self._render_generation:
             return False
-        self.send_M9000_cmd("D1")
+        firmware.refreshed()
         self.sent_imagemap = True
         self.thumb_rendered_event.set()
         return True
@@ -507,13 +632,19 @@ class LCD_E3V3SEPlugin(
 
     def gcode_received_handler(self, comm, line, *args, **kwargs):
         self._purge.received(line)
+        self._caps.received(line)
         self._draw.received(line)
+        self._legacy.received(line)
         if line.startswith(("//action:prompt_begin", "//action:paused")):
             self._draw.cancel()
+            self._legacy.cancel()
+            self._caps.wake()
         if line.startswith("M9000"):
             if "lcd-rendered" in line:
                 self.is_lcd_ready = True
             elif "pause-job" in line and self._printer.is_printing():
+                if self._metadata_running:
+                    self._stop_pause_gate()
                 self._printer.pause_print()
             elif "resume-job" in line and self._printer.is_paused():
                 if not self._purge.firmware_pause:

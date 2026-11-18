@@ -5,6 +5,7 @@ import struct
 import threading
 import time
 import zlib
+from .firmware_caps import is_v2_caps
 
 VERSION = 2
 PAYLOAD = 42
@@ -57,7 +58,7 @@ class DrawingClient:
 
     def received(self, line):
         fields = line.strip().split()
-        if fields[:5] == ["M9001", "CAPS", "2", "42", "240"] and len(fields) >= 6 and fields[5] == "320":
+        if is_v2_caps(line):
             with self.condition:
                 self.version = 2
                 self.condition.notify_all()

@@ -1,6 +1,9 @@
 # Host-only print-card rendering (M9001 v2)
 
-Use `main_cleanup` together with Marlin `c13_octoprint_cleanup`. The native LCD
+This guide describes the preserved v2 backend of `main_cleanup`, paired with
+Marlin `c13_pure_octoprint` or `c14_pure_octoprint` (previously named
+`c13_octoprint_cleanup`). For v1 and automatic selection, see
+[the unified protocol guide](unified-protocols.md). The native LCD
 MAIN and controls remain in Marlin. This plugin does not replace MAIN, Tune,
 pause/stop confirmation dialogs, temperature status or safety prompts.
 

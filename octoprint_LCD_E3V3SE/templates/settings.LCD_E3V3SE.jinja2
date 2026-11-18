@@ -211,6 +211,18 @@
 
     <!-- Command Display Options -->
     <div class="setting-group">
+        <div class="setting-title">LCD Protocol</div>
+        <label for="e3v3selcd-lcd-protocol">Firmware transport</label>
+        <select id="e3v3selcd-lcd-protocol" data-bind="value: settings.plugins.LCD_E3V3SE.lcd_protocol">
+            <option value="auto">Auto Detect</option>
+            <option value="v1">Legacy M9001 v1</option>
+            <option value="v2">M9001 Draw v2</option>
+        </select>
+        <p class="help-block">Applies to the next file selection. Overrides still require a valid firmware handshake.</p>
+        <p>Connection status: <span id="e3v3selcd-protocol-status">Not connected</span></p>
+    </div>
+
+    <div class="setting-group">
         <div class="setting-title">Command Display Options</div>
         <div class="divider"></div>
         <p>Select whether to send and display the Gcode Thumbnail Preview on the LCD:</p>

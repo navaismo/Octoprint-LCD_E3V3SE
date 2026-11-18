@@ -3,10 +3,22 @@
 Send print details and a 96×96 thumbnail to the Ender-3 V3 SE LCD through the
 printer's normal OctoPrint connection. MeatPack and native M600 prompts remain.
 
-This is **main_cleanup**, paired with Marlin **c13_octoprint_cleanup** and
-**M9001 v2**. Use matching versions. The old START/C/END thumbnail sender is not
-compatible with this firmware. Recent hardware tests reported communication
-timeouts and G-code checksum resends; their cause is still under investigation.
+**main_cleanup** is the maintained implementation for OctoPrint **1.11.x and
+2.0.x**, with automatic selection of the existing Marlin thumbnail protocols:
+
+| Firmware | Protocol |
+|---|---|
+| `c13_octoprint` | M9001 v1 (START/C/END) |
+| `c14_octoprint` | M9001 v1 (START/C/END) |
+| `c13_pure_octoprint` | M9001 Draw v2 (CAPS/B/D/E/A) |
+| `c14_pure_octoprint` | M9001 Draw v2 (CAPS/B/D/E/A) |
+
+The existing v2 DrawingClient and counted job holds remain the foundation. An
+independent legacy transport sends RGB565 rows with firmware acknowledgments.
+Both use OctoPrint's public command API and normal serial/MeatPack connection.
+Recent hardware reports include communication timeouts and checksum resends;
+passing software tests does not establish their cause or physical stability.
+See the [compatibility audit and four-way validation guide](docs/unified-protocols.md).
 
 ## Table of contents
 
@@ -25,9 +37,10 @@ timeouts and G-code checksum resends; their cause is still under investigation.
 
 ## Requirements
 
-- Marlin `c13_octoprint_cleanup`, with OCTOPRINT_PLUGIN, DWIN_RENDER_THUMBNAIL
-  and M9001_DRAW_PROTOCOL. This firmware prints from the host; SD bootloader
-  updates remain available.
+- Modified Marlin from the matrix, with OCTOPRINT_PLUGIN and
+  DWIN_RENDER_THUMBNAIL; Pure Host v2 also requires M9001_DRAW_PROTOCOL.
+  Firmware and TFT resources must match the printer. The plugin does not flash
+  firmware or change the existing native LCD layout.
 - The matching plugin `main_cleanup`, OctoPrint and Pillow (declared dependency).
 - Slicer M73 progress. M73 L supplies actual layer progress; M73 P/R supplies
   percentage/time-left. [Slicer setup](https://github.com/navaismo/Octoprint-LCD_E3V3SE/wiki/Enable-M73-Support).
@@ -36,20 +49,31 @@ timeouts and G-code checksum resends; their cause is still under investigation.
 
 ## Installation
 
-1. Obtain the matching `main_cleanup` plugin ZIP and Marlin firmware.
+1. Obtain the `main_cleanup` plugin ZIP and matching firmware from the matrix.
 2. In OctoPrint, open **Settings → Plugin Manager → Get More → Install from File**.
 3. Install the ZIP and restart OctoPrint.
 4. Update Marlin using the printer's existing firmware-update procedure.
 
-Do not substitute an old plugin release merely because it supports M9001: v2
-uses different records and flow control.
+The same plugin supports both transports. An old START/C/END-only plugin cannot
+communicate with Pure Host v2; its record format and flow control are different.
 
 ## Configuration
 
 1. Open **Settings → LCD E3V3SE**.
-2. Enable **G-code Preview** to draw the thumbnail; without it, the card uses MODEL.
-3. Select **M73** progress and optionally enable the paused-filament purge button.
-4. Save the settings and restart OctoPrint if prompted.
+2. Enable **G-code Preview** to draw the thumbnail; without it, v2 uses MODEL
+   and v1 keeps its native screen.
+3. Leave **LCD Protocol → Auto Detect**, or select Legacy M9001 v1 / M9001 Draw v2.
+   The connection status appears in settings and the plugin log. Overrides still
+   require firmware confirmation and apply on the next file selection.
+4. Select **M73** progress and optionally enable the paused-filament purge button.
+5. Save the settings and restart OctoPrint if prompted.
+
+Detection sends one non-destructive `M9001 Q` per connection. A valid v2 CAPS
+response selects v2. After two seconds without CAPS, legacy becomes a candidate;
+its START must be acknowledged before any pixels are sent. START is never used
+as a connection-time probe. A v2 override fails without valid CAPS. Unsupported
+CAPS, timeouts, errors, cancellation and disconnect end preparation and release
+only the plugin's job hold, allowing the normal job lifecycle to continue.
 
 PNG and JPEG `thumbnail`, `thumbnail_PNG`, `thumbnail_JPG` and `thumbnail_JPEG`
 blocks at 96×96 are supported without a slicer identification header. Optionally
@@ -84,7 +108,7 @@ Native MAIN retains its encoder selection and menus:
 
 <img src="docs/screens/main-print.png" width="86" alt="Print reference"> <img src="docs/screens/main-prepare.png" width="86" alt="Prepare reference"> <img src="docs/screens/main-control.png" width="86" alt="Control reference"> <img src="docs/screens/main-leveling.png" width="86" alt="Leveling reference">
 
-MAIN Print displays **Upload to Host / and start from there**, with working Back.
+On Pure Host v2, MAIN Print displays **Upload to Host / and start from there**, with working Back.
 The print card keeps the filename on top, a green-framed thumbnail on the left,
 the native cube on the right, four metadata rows below, and native controls and
 temperatures at the bottom.
@@ -114,6 +138,14 @@ traffic after reported timeouts/resends. The percentage cube remains enabled.
 This change is not proof of the checksum error's cause.
 
 ## Protocol and architecture
+
+The following drawing details describe v2. Legacy uses the same image processing
+and hold owner, while retaining its native per-pixel renderer at (12,25). It
+sends twelve RGB565 pixels per C command, waits for each `M9001 ACK LINE n`, then
+requires END followed by thumbnail-rendered. At most one row is queued. Legacy
+receives T/L/P metadata; H/E/D1 remain v2-only. R1/R0 pause notifications are
+supported by all four audited firmware branches. See the
+[full M9000 mapping and failure behavior](docs/unified-protocols.md).
 
 The host does the expensive work: image decoding, alpha/background composition,
 96×96 resize, RGB565 conversion, horizontal runs, vertical merging and color
@@ -230,7 +262,9 @@ for stage measurements, test evidence and remaining hardware checks.
 ## Validation
 
 Run `python -m unittest discover -s tests` and
-`node tests/test_purge_frontend.js`. Full lifecycle tests need OctoPrint; image
+`node tests/test_purge_frontend.js` plus `node tests/test_protocol_frontend.js`.
+Run the Python suite separately under OctoPrint 1.11.x and 2.0.x.
+Full lifecycle tests need OctoPrint; image
 tests need Pillow. The firmware repository supplies ASan/UBSan, exact-pixel,
 sequence, abort, bounds and MeatPack round-trip checks. Earlier native checks
 included the enabled caption; update that expectation before using them to
@@ -240,6 +274,10 @@ Retest sustained host printing, timeouts/resends, controls, M600, disconnects an
 LCD pacing on hardware. Passing offline tests does not resolve the reported
 communication issue. No plugin installation or hardware flashing is performed
 by the tests.
+
+The [validation guide](docs/unified-protocols.md) records the software test
+results, remaining legacy limitations and exact manual checks for 1.x/v1,
+1.x/v2, 2.0/v1 and 2.0/v2. Hardware compatibility requires those physical checks.
 
 ## Disclaimer
 BAU:
