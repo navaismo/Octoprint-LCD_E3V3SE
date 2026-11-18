@@ -2,3 +2,6 @@ include README.md
 recursive-include octoprint_LCD_E3V3SE/templates *
 recursive-include octoprint_LCD_E3V3SE/translations *
 recursive-include octoprint_LCD_E3V3SE/static *
+
+recursive-include docs *.md
+recursive-include tests *.py *.js

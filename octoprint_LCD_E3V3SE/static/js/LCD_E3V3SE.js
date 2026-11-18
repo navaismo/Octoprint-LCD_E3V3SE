@@ -1,6 +1,14 @@
 $(function () {
     function LCD_E3V3SEViewModel(parameters) {
         var self = this;
+        self.protocolStatus = function (status) {
+            $("#e3v3selcd-protocol-status").text(status);
+        };
+        self.onSettingsShown = function () {
+            OctoPrint.simpleApiGet("LCD_E3V3SE").done(function (data) {
+                self.protocolStatus(data.protocol);
+            });
+        };
 
         function showPopup(message) {
             console.log("Attempting to show popup:", message);
@@ -281,7 +289,9 @@ $(function () {
             console.log(">>> Received plugin message from:", plugin, "Data:", data);
             if (plugin !== "LCD_E3V3SE") return;
 
-            if (data.type === "popup") {
+            if (data.type === "protocol_status") {
+                self.protocolStatus(data.protocol);
+            } else if (data.type === "popup") {
                 //console.log(">>> Showing popup with message:", data.message);
                 showPopup(data.message);
             } else if (data.type === "close_popup") {
